@@ -10,6 +10,6 @@
   "auto_upload_retry_seconds": 300,
   "network_check_interval_seconds": 10,
   "ssh_connect_timeout_seconds": 30,
-  "stall_timeout_seconds": 600,
-  "loop_upload_interval": 300
+  "stall_timeout_seconds": 100,
+  "loop_upload_interval": 200
 }
