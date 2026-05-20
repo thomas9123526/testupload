@@ -1,0 +1,72 @@
+---
+description: After each small task, write story_cursor MD and git commit with a work report
+alwaysApply: true
+---
+
+# Task commit and conversation story
+
+After completing **each discrete user task** (one request = one task), before ending your response:
+
+## 1. Write story file
+
+Create `story_cursor/{datetime}_{shorttitle}.md`:
+
+| Part | Format |
+|------|--------|
+| `datetime` | `YYMMDD_HHMM` local time (e.g. `250520_1530`) |
+| `shorttitle` | ≤50 chars, lowercase, `[a-z0-9_-]` only, words joined with `_` |
+
+**Story body (required sections):**
+
+```markdown
+# {Short title}
+
+**Date:** {ISO date}
+**Task:** {one-line summary}
+
+## What was done
+
+- {bullet list of changes and why}
+
+## Files changed
+
+- `path` — {brief note}
+
+## User prompt
+
+{paste the user's exact message for this task, verbatim}
+```
+
+- Do not include passwords, API keys, or secrets from `upload_config.json`.
+- Skip story + commit if the task was **questions only** with **no file changes**.
+
+## 2. Git commit
+
+When there are changes to commit:
+
+1. `git status` and `git diff` — never commit `.env`, `upload_config.json`, or credentials.
+2. Stage only relevant files **including** the new story markdown.
+3. Commit with a message that reports what was done (1–2 sentences, focus on why).
+
+```
+{shorttitle}: {what was done}
+```
+
+## 3. When to run
+
+| Situation | Action |
+|-----------|--------|
+| User gave a small, finished task | Story + commit |
+| Multi-step task, one logical unit done | Story + commit for that unit |
+| User said "don't commit" | Skip commit; still write story if they asked for stories |
+| No file changes | No commit; no story unless user asked for a story-only summary |
+
+## Filename helper (optional)
+
+```powershell
+.\.cursor\scripts\New-StoryPath.ps1 -ShortTitle "configure_cursor_commit_rules"
+```
+
+## Priority
+
+This rule applies to this project. Follow it after every completed small task unless the user explicitly opts out for that message.
