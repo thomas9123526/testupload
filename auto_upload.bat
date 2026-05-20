@@ -52,9 +52,10 @@ if "%CODE%"=="1" (
 exit /b 0
 
 :read_interval
-set "INTERVAL=300"
-for /f %%i in ('"%PYTHON%" "%~dp0read_auto_upload_retry.py"') do set "INTERVAL=%%i"
-echo Retry interval: !INTERVAL!s ^(auto_upload_retry_seconds in config.json^)
+set "INTERVAL="
+for /f "delims=" %%i in ('"%PYTHON%" "%~dp0read_auto_upload_retry.py"') do set "INTERVAL=%%i"
+if not defined INTERVAL set "INTERVAL=300"
+echo Retry interval: !INTERVAL!s ^(config.json: auto_upload_retry_seconds^)
 exit /b 0
 
 :countdown
