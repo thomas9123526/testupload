@@ -146,13 +146,19 @@ def sync_uploaded_success_list(status: dict[str, Any]) -> None:
 def load_status(settings: dict[str, Any]) -> dict[str, Any]:
     path = status_path(settings)
     if not path.exists():
-        return {"version": 1, "uploaded_success": [], "files": {}}
+        return {
+            "version": 1,
+            "auto_upload_retry_seconds": 300,
+            "uploaded_success": [],
+            "files": {},
+        }
 
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
     data.setdefault("version", 1)
     data.setdefault("files", {})
+    data.setdefault("auto_upload_retry_seconds", 300)
     sync_uploaded_success_list(data)
     return data
 
