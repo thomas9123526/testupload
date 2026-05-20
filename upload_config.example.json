@@ -1,0 +1,11 @@
+{
+  "host": "64.20.33.250",
+  "port": 22,
+  "username": "st78326",
+  "password": "YOUR_PASSWORD_HERE",
+  "local_dir": "material",
+  "remote_dir": "material",
+  "status_file": "config.json",
+  "network_check_interval_seconds": 10,
+  "ssh_connect_timeout_seconds": 30
+}
