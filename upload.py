@@ -356,25 +356,33 @@ def ensure_network(settings: dict[str, Any]) -> None:
 class TransferTracker:
     """Tracks time since last byte moved; aborts if idle too long."""
 
-    _COUNTDOWN_PREFIX = "      stall timeout in "
+    _IDLE_SHOW_AFTER_SECONDS = 2
 
     def __init__(self, timeout_seconds: int) -> None:
         self.timeout_seconds = timeout_seconds
         self._last_at = time.time()
         self._lock = threading.Lock()
         self._abort = threading.Event()
-        self._last_countdown = -1
+        self._activity = "Starting"
+        self._detail = ""
+        self._last_status_line = ""
+
+    def set_activity(self, activity: str, detail: str = "") -> None:
+        with self._lock:
+            self._activity = activity
+            self._detail = detail
+            self._last_status_line = ""
 
     def note(self, nbytes: int) -> None:
         if nbytes > 0:
             with self._lock:
                 self._last_at = time.time()
-                self._last_countdown = -1
+                self._last_status_line = ""
 
     def touch(self) -> None:
         with self._lock:
             self._last_at = time.time()
-            self._last_countdown = -1
+            self._last_status_line = ""
 
     def idle_seconds(self) -> float:
         with self._lock:
@@ -383,28 +391,47 @@ class TransferTracker:
     def remaining_seconds(self) -> int:
         return max(0, int(self.timeout_seconds - self.idle_seconds()))
 
-    def clear_countdown(self) -> None:
-        width = len(self._COUNTDOWN_PREFIX) + len(str(self.timeout_seconds)) + 2
-        print("\r" + (" " * width) + "\r", end="", flush=True)
-        self._last_countdown = -1
-
-    def _show_countdown(self) -> None:
+    def _format_status_line(self) -> str:
+        with self._lock:
+            activity = self._activity
+            detail = self._detail
+        idle = int(self.idle_seconds())
         remaining = self.remaining_seconds()
-        if remaining == self._last_countdown:
-            return
-        self._last_countdown = remaining
-        print(
-            f"\r{self._COUNTDOWN_PREFIX}{remaining}s ",
-            end="",
-            flush=True,
+        if detail:
+            reason = f"{activity} — {detail}"
+        else:
+            reason = activity
+        return (
+            f"      Waiting: {reason} "
+            f"(idle {idle}s, stall in {remaining}s) "
         )
+
+    def clear_countdown(self) -> None:
+        if self._last_status_line:
+            print("\r" + (" " * len(self._last_status_line)) + "\r", end="", flush=True)
+            self._last_status_line = ""
+
+    def _show_status_if_idle(self) -> None:
+        if self.idle_seconds() < self._IDLE_SHOW_AFTER_SECONDS:
+            if self._last_status_line:
+                self.clear_countdown()
+            return
+        line = self._format_status_line()
+        if line == self._last_status_line:
+            return
+        self._last_status_line = line
+        print(f"\r{line}", end="", flush=True)
 
     def check(self) -> None:
         idle = self.idle_seconds()
         if idle > self.timeout_seconds:
             self.clear_countdown()
+            with self._lock:
+                activity = self._activity
+                detail = self._detail
+            where = f"{activity}: {detail}" if detail else activity
             raise TransferStalledError(
-                f"No data transferred for {int(idle)}s "
+                f"No data transferred for {int(idle)}s while {where} "
                 f"(limit: {self.timeout_seconds}s in upload_config.json)"
             )
 
@@ -418,7 +445,7 @@ class TransferTracker:
             while not stop.wait(1):
                 if self._abort.is_set():
                     return
-                self._show_countdown()
+                self._show_status_if_idle()
                 if self.idle_seconds() > self.timeout_seconds:
                     self.clear_countdown()
                     if on_stall is not None:
@@ -473,24 +500,35 @@ def ssh_connect_kwargs(settings: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
-def connect_ssh(settings: dict[str, Any]) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+def connect_ssh(
+    settings: dict[str, Any],
+    tracker: TransferTracker | None = None,
+) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
     """Connect with retries; SFTP-only (no shell) for shared-host compatibility."""
     max_attempts = 3
     last_error: BaseException | None = None
     connect_kwargs = ssh_connect_kwargs(settings)
+    target = f"{settings['username']}@{settings['host']}:{settings['port']}"
 
     for attempt in range(1, max_attempts + 1):
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
+            if tracker is not None:
+                detail = target if attempt == 1 else f"{target} (retry {attempt}/{max_attempts})"
+                tracker.set_activity("Connecting SSH/SFTP", detail)
             if attempt > 1:
                 print(f"  Retry {attempt}/{max_attempts} ...")
             client.connect(**connect_kwargs)
             transport = client.get_transport()
             if transport is not None:
                 transport.set_keepalive(30)
+            if tracker is not None:
+                tracker.set_activity("Opening SFTP session", target)
             print("  Opening SFTP session...")
             sftp = client.open_sftp()
+            if tracker is not None:
+                tracker.touch()
             return client, sftp
         except AuthenticationException:
             close_ssh(client, None)
@@ -560,10 +598,14 @@ def sync_remote_directory_tree(
     sftp: paramiko.SFTPClient,
     server_upload_path: str,
     local_root: Path,
+    tracker: TransferTracker | None = None,
 ) -> None:
     """Create the same folder tree on the server as inside material/."""
     remote_base = resolve_remote_path(server_upload_path, "")
     local_dirs = scan_local_directories(local_root)
+
+    if tracker is not None:
+        tracker.set_activity("Creating remote folders", remote_base)
 
     print(f"Creating remote folder tree under {remote_base} ...")
     ensure_remote_directory(sftp, remote_base)
@@ -583,8 +625,12 @@ def remote_file_info(
     sftp: paramiko.SFTPClient,
     remote_path: str,
     tracker: TransferTracker | None = None,
+    label: str = "",
 ) -> dict[str, Any] | None:
     """Compare remote file via SFTP only (avoids extra SSH exec channels on shared hosts)."""
+    display = label or remote_path
+    if tracker is not None:
+        tracker.set_activity("Checking remote file on server", display)
     try:
         attr = sftp.stat(remote_path)
     except OSError:
@@ -592,6 +638,8 @@ def remote_file_info(
 
     digest = hashlib.sha256()
     try:
+        if tracker is not None:
+            tracker.set_activity("Reading remote file hash", display)
         with sftp.open(remote_path, "rb") as remote_file:
             while True:
                 if tracker is not None:
@@ -648,7 +696,11 @@ def upload_with_retry(
     tracker: TransferTracker,
     label: str,
 ) -> None:
+    if tracker is not None:
+        tracker.set_activity("Preparing remote path", label)
     ensure_remote_dir(sftp, remote_path)
+    if tracker is not None:
+        tracker.set_activity("Uploading", label)
     start_time = time.time()
     last_report = start_time
     last_done = 0
@@ -690,6 +742,8 @@ def upload_with_retry(
     put_thread = threading.Thread(target=do_put, daemon=True)
     put_thread.start()
     while not put_finished.wait(1.0):
+        if tracker is not None:
+            tracker.set_activity("Uploading (no bytes yet)", label)
         tracker.check()
 
     put_thread.join()
@@ -747,8 +801,6 @@ def process_files(settings: dict[str, Any]) -> int:
         print("Nothing to do.")
         return 0
 
-    ensure_network(settings)
-
     server_path = settings["server_upload_path"]
     remote_base = resolve_remote_path(server_path, "")
     client: paramiko.SSHClient | None = None
@@ -761,9 +813,13 @@ def process_files(settings: dict[str, Any]) -> int:
         close_ssh(client, sftp)
         if watchdog_stop is not None:
             watchdog_stop.set()
+        tracker.set_activity(
+            "Checking network",
+            f"{settings['host']}:{settings['port']}",
+        )
         ensure_network(settings)
         print(f"Connecting to {settings['username']}@{settings['host']}:{settings['port']} ...")
-        client, sftp = connect_ssh(settings)
+        client, sftp = connect_ssh(settings, tracker)
         tracker.touch()
 
         def on_stall() -> None:
@@ -780,7 +836,7 @@ def process_files(settings: dict[str, Any]) -> int:
     processed = 0
 
     try:
-        sync_remote_directory_tree(sftp, server_path, local_root)
+        sync_remote_directory_tree(sftp, server_path, local_root, tracker)
 
         for rel_path, local_path, info in queue:
             tracker.check()
@@ -788,7 +844,8 @@ def process_files(settings: dict[str, Any]) -> int:
             remote_path = resolve_remote_path(settings["server_upload_path"], rel_path)
             prefix = f"[{processed}/{pending}] {rel_path}"
 
-            remote_info = remote_file_info(sftp, remote_path, tracker)
+            tracker.set_activity("Pending", f"compare with server: {rel_path}")
+            remote_info = remote_file_info(sftp, remote_path, tracker, label=prefix)
             if (
                 remote_info is not None
                 and remote_info["size"] == info["size"]
@@ -803,7 +860,8 @@ def process_files(settings: dict[str, Any]) -> int:
                 settings, sftp, local_path, remote_path, info["size"], tracker, prefix
             )
 
-            verify = remote_file_info(sftp, remote_path, tracker)
+            tracker.set_activity("Verifying upload", prefix)
+            verify = remote_file_info(sftp, remote_path, tracker, label=prefix)
             if (
                 verify is None
                 or verify["size"] != info["size"]
