@@ -4,6 +4,7 @@ Run upload.py in a loop until success.
 
 - Exit 0 from upload.py → print green success and stop
 - Any error → print red reason, countdown (auto_upload_retry_seconds from config.json), retry
+- Press any key during countdown → retry immediately
 - Ctrl+C → stop (exit 130)
 """
 
@@ -116,11 +117,63 @@ def run_upload() -> int:
     return int(result.returncode)
 
 
-def countdown(seconds: int) -> None:
-    for remaining in range(seconds, 0, -1):
-        print(f"\r{YELLOW}Retrying upload in {remaining} seconds...{RESET}", end="", flush=True)
+def wait_one_second_or_key() -> bool:
+    """Sleep up to one second; return True if a key was pressed."""
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+        except ImportError:
+            time.sleep(1)
+            return False
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if msvcrt.kbhit():
+                msvcrt.getch()
+                return True
+            time.sleep(0.05)
+        return False
+
+    if not sys.stdin.isatty():
         time.sleep(1)
+        return False
+
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        time.sleep(1)
+        return False
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+        if ready:
+            sys.stdin.read(1)
+            return True
+        return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def countdown(seconds: int) -> bool:
+    """Count down retry delay. Returns True if the user skipped with a keypress."""
+    for remaining in range(seconds, 0, -1):
+        print(
+            f"\r{YELLOW}Retrying upload in {remaining} seconds... "
+            f"(press any key to retry now){RESET}",
+            end="",
+            flush=True,
+        )
+        if wait_one_second_or_key():
+            print(flush=True)
+            cprint("Retrying upload now (key pressed).", YELLOW)
+            return True
     print(flush=True)
+    return False
 
 
 def main() -> int:
