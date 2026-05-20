@@ -4,8 +4,7 @@ Resumable SFTP uploader for the material/ folder.
 
 - Mirrors the local material/ folder tree on the server (same subfolders)
 - Tracks per-file upload status in config.json (including uploaded_success filename list)
-- Retries when the network drops (waits until connectivity returns)
-- Reconnects when the SSH/SFTP session drops and resumes from config.json
+- Exits on network/server failure or transfer stall (progress saved in config.json)
 - Skips remote files that match local content (SHA-256 + size)
 """
 
@@ -16,10 +15,11 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -71,7 +71,15 @@ FAIL = "\u2717"   # ✗
 
 
 class SSHDisconnectedError(Exception):
-    """Raised when the SSH session is lost and the script must exit."""
+    """Raised when the SSH session is lost."""
+
+
+class NetworkUnavailableError(Exception):
+    """Raised when the server cannot be reached."""
+
+
+class TransferStalledError(Exception):
+    """Raised when no data is transferred within the configured timeout."""
 
 
 def load_settings() -> dict[str, Any]:
@@ -115,6 +123,7 @@ def load_settings() -> dict[str, Any]:
     settings.setdefault("status_file", "config.json")
     settings.setdefault("network_check_interval_seconds", 10)
     settings.setdefault("ssh_connect_timeout_seconds", 30)
+    settings.setdefault("stall_timeout_seconds", 600)
     return settings
 
 
@@ -258,19 +267,70 @@ def is_ssh_disconnect(error: BaseException) -> bool:
     return any(marker in message for marker in markers)
 
 
-def wait_for_network(settings: dict[str, Any]) -> None:
+def ensure_network(settings: dict[str, Any]) -> None:
+    """Verify host:port is reachable; exit path if not."""
     host = settings["host"]
     port = int(settings["port"])
-    interval = int(settings["network_check_interval_seconds"])
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return
+    except OSError as error:
+        raise NetworkUnavailableError(
+            f"Cannot connect to {host}:{port} ({error})"
+        ) from error
 
-    print(f"\nNetwork unavailable. Waiting for {host}:{port} ...")
-    while True:
-        try:
-            with socket.create_connection((host, port), timeout=5):
-                print("Network is back.\n")
-                return
-        except OSError:
-            time.sleep(interval)
+
+class TransferTracker:
+    """Tracks time since last byte moved; aborts if idle too long."""
+
+    def __init__(self, timeout_seconds: int) -> None:
+        self.timeout_seconds = timeout_seconds
+        self._last_at = time.time()
+        self._lock = threading.Lock()
+        self._abort = threading.Event()
+
+    def note(self, nbytes: int) -> None:
+        if nbytes > 0:
+            with self._lock:
+                self._last_at = time.time()
+
+    def touch(self) -> None:
+        with self._lock:
+            self._last_at = time.time()
+
+    def idle_seconds(self) -> float:
+        with self._lock:
+            return time.time() - self._last_at
+
+    def check(self) -> None:
+        idle = self.idle_seconds()
+        if idle > self.timeout_seconds:
+            raise TransferStalledError(
+                f"No data transferred for {int(idle)}s "
+                f"(limit: {self.timeout_seconds}s in upload_config.json)"
+            )
+
+    def start_watchdog(
+        self,
+        on_stall: Callable[[], None] | None = None,
+    ) -> threading.Event:
+        stop = threading.Event()
+
+        def watcher() -> None:
+            while not stop.wait(5):
+                if self.idle_seconds() > self.timeout_seconds:
+                    if on_stall is not None:
+                        on_stall()
+                    self._abort.set()
+                    return
+
+        threading.Thread(target=watcher, daemon=True).start()
+        return stop
+
+    @property
+    def aborted(self) -> bool:
+        return self._abort.is_set()
+
 
 
 def close_ssh(
@@ -416,7 +476,11 @@ def sync_remote_directory_tree(
     print()
 
 
-def remote_file_info(sftp: paramiko.SFTPClient, remote_path: str) -> dict[str, Any] | None:
+def remote_file_info(
+    sftp: paramiko.SFTPClient,
+    remote_path: str,
+    tracker: TransferTracker | None = None,
+) -> dict[str, Any] | None:
     """Compare remote file via SFTP only (avoids extra SSH exec channels on shared hosts)."""
     try:
         attr = sftp.stat(remote_path)
@@ -427,10 +491,16 @@ def remote_file_info(sftp: paramiko.SFTPClient, remote_path: str) -> dict[str, A
     try:
         with sftp.open(remote_path, "rb") as remote_file:
             while True:
+                if tracker is not None:
+                    tracker.check()
                 chunk = remote_file.read(1024 * 1024)
                 if not chunk:
                     break
+                if tracker is not None:
+                    tracker.note(len(chunk))
                 digest.update(chunk)
+    except TransferStalledError:
+        raise
     except Exception as error:
         if is_ssh_disconnect(error):
             raise SSHDisconnectedError(str(error)) from error
@@ -464,46 +534,72 @@ def upload_with_retry(
     local_path: Path,
     remote_path: str,
     total_size: int,
+    tracker: TransferTracker,
 ) -> None:
-    while True:
-        try:
-            ensure_remote_dir(sftp, remote_path)
-            start_time = time.time()
-            last_report = start_time
-            last_done = 0
+    ensure_remote_dir(sftp, remote_path)
+    start_time = time.time()
+    last_report = start_time
+    last_done = 0
+    put_finished = threading.Event()
+    put_error: list[BaseException] = []
 
-            def callback(done: int, total: int) -> None:
-                nonlocal last_report, last_done
-                now = time.time()
-                if now - last_report < 0.2 and done != total:
-                    return
-                elapsed = max(now - start_time, 0.001)
-                interval = max(now - last_report, 0.001)
-                avg_speed = done / elapsed
-                instant_speed = (done - last_done) / interval
-                speed = instant_speed if last_done > 0 else avg_speed
-                last_report = now
-                last_done = done
-                percent = (done / total * 100) if total else 100.0
-                print(
-                    f"\r      progress: {format_bytes(done)} / {format_bytes(total)} "
-                    f"({percent:5.1f}%) @ {format_speed(speed)}",
-                    end="",
-                    flush=True,
-                )
-
-            sftp.put(str(local_path), remote_path, callback=callback, confirm=True)
-            elapsed = max(time.time() - start_time, 0.001)
-            avg_speed = total_size / elapsed
-            print(f"\r      progress: {format_bytes(total_size)} / {format_bytes(total_size)} "
-                  f"(100.0%) @ {format_speed(avg_speed)} (avg)")
+    def callback(done: int, total: int) -> None:
+        nonlocal last_report, last_done
+        if done > last_done:
+            tracker.note(done - last_done)
+        if tracker.aborted:
+            raise TransferStalledError(
+                f"No data transferred for {settings['stall_timeout_seconds']}s "
+                f"(limit in upload_config.json)"
+            )
+        tracker.check()
+        now = time.time()
+        if now - last_report < 0.2 and done != total:
             return
-        except Exception as error:
-            if is_ssh_disconnect(error):
-                raise SSHDisconnectedError(str(error)) from error
-            print(f"\n      upload error: {error}")
-            wait_for_network(settings)
-            print("      retrying upload...")
+        elapsed = max(now - start_time, 0.001)
+        interval = max(now - last_report, 0.001)
+        avg_speed = done / elapsed
+        instant_speed = (done - last_done) / interval
+        speed = instant_speed if last_done > 0 else avg_speed
+        last_report = now
+        last_done = done
+        percent = (done / total * 100) if total else 100.0
+        print(
+            f"\r      progress: {format_bytes(done)} / {format_bytes(total)} "
+            f"({percent:5.1f}%) @ {format_speed(speed)}",
+            end="",
+            flush=True,
+        )
+
+    def do_put() -> None:
+        try:
+            sftp.put(str(local_path), remote_path, callback=callback, confirm=True)
+        except BaseException as error:
+            put_error.append(error)
+        finally:
+            put_finished.set()
+
+    tracker.touch()
+    put_thread = threading.Thread(target=do_put, daemon=True)
+    put_thread.start()
+    while not put_finished.wait(1.0):
+        tracker.check()
+
+    put_thread.join()
+    if put_error:
+        error = put_error[0]
+        if isinstance(error, TransferStalledError):
+            raise error
+        if is_ssh_disconnect(error):
+            raise SSHDisconnectedError(str(error)) from error
+        raise error
+
+    elapsed = max(time.time() - start_time, 0.001)
+    avg_speed = total_size / elapsed if total_size else 0
+    print(
+        f"\r      progress: {format_bytes(total_size)} / {format_bytes(total_size)} "
+        f"(100.0%) @ {format_speed(avg_speed)} (avg)"
+    )
 
 
 def process_files(settings: dict[str, Any]) -> int:
@@ -530,26 +626,33 @@ def process_files(settings: dict[str, Any]) -> int:
         print("Nothing to do.")
         return 0
 
+    ensure_network(settings)
+
     server_path = settings["server_upload_path"]
     remote_base = resolve_remote_path(server_path, "")
     client: paramiko.SSHClient | None = None
     sftp: paramiko.SFTPClient | None = None
+    tracker = TransferTracker(int(settings["stall_timeout_seconds"]))
+    watchdog_stop: threading.Event | None = None
 
     def open_session() -> None:
-        nonlocal client, sftp
+        nonlocal client, sftp, watchdog_stop
         close_ssh(client, sftp)
+        if watchdog_stop is not None:
+            watchdog_stop.set()
+        ensure_network(settings)
         print(f"Connecting to {settings['username']}@{settings['host']}:{settings['port']} ...")
         client, sftp = connect_ssh(settings)
+        tracker.touch()
 
-    def reconnect_session() -> None:
-        print("\nSSH session lost. Waiting for network, then reconnecting...")
-        wait_for_network(settings)
-        open_session()
-        print(f"Reconnected. Server upload path: {remote_base}\n")
-        sync_remote_directory_tree(sftp, server_path, local_root)
+        def on_stall() -> None:
+            close_ssh(client, sftp)
+
+        watchdog_stop = tracker.start_watchdog(on_stall=on_stall)
 
     open_session()
     print(f"Connected. Server upload path: {remote_base}\n")
+    print(f"Stall timeout: {settings['stall_timeout_seconds']}s without data transfer\n")
 
     uploaded_count = 0
     skipped_count = 0
@@ -559,53 +662,45 @@ def process_files(settings: dict[str, Any]) -> int:
         sync_remote_directory_tree(sftp, server_path, local_root)
 
         for rel_path, local_path, info in queue:
+            tracker.check()
             processed += 1
             remote_path = resolve_remote_path(settings["server_upload_path"], rel_path)
             prefix = f"[{processed}/{pending}] {rel_path}"
 
-            while True:
-                try:
-                    remote_info = remote_file_info(sftp, remote_path)
-                    if (
-                        remote_info is not None
-                        and remote_info["size"] == info["size"]
-                        and remote_info["sha256"] == info["sha256"]
-                    ):
-                        mark_uploaded(settings, status, rel_path, info, action="skipped_identical")
-                        skipped_count += 1
-                        print(f"{prefix} ... {SKIP} skipped (identical on server)")
-                        break
+            remote_info = remote_file_info(sftp, remote_path, tracker)
+            if (
+                remote_info is not None
+                and remote_info["size"] == info["size"]
+                and remote_info["sha256"] == info["sha256"]
+            ):
+                mark_uploaded(settings, status, rel_path, info, action="skipped_identical")
+                skipped_count += 1
+                print(f"{prefix} ... {SKIP} skipped (identical on server)")
+                continue
 
-                    if remote_info is not None:
-                        print(f"{prefix} ... remote differs, uploading")
-                    else:
-                        print(f"{prefix} ... uploading")
+            if remote_info is not None:
+                print(f"{prefix} ... remote differs, uploading")
+            else:
+                print(f"{prefix} ... uploading")
 
-                    upload_with_retry(settings, sftp, local_path, remote_path, info["size"])
+            upload_with_retry(
+                settings, sftp, local_path, remote_path, info["size"], tracker
+            )
 
-                    verify = remote_file_info(sftp, remote_path)
-                    if (
-                        verify is None
-                        or verify["size"] != info["size"]
-                        or verify["sha256"] != info["sha256"]
-                    ):
-                        raise RuntimeError("Upload finished but remote verification failed.")
+            verify = remote_file_info(sftp, remote_path, tracker)
+            if (
+                verify is None
+                or verify["size"] != info["size"]
+                or verify["sha256"] != info["sha256"]
+            ):
+                raise RuntimeError("Upload finished but remote verification failed.")
 
-                    mark_uploaded(settings, status, rel_path, info, action="uploaded")
-                    uploaded_count += 1
-                    print(f"{prefix} ... {CHECK} success")
-                    break
-
-                except SSHDisconnectedError:
-                    reconnect_session()
-                except Exception as error:
-                    if is_ssh_disconnect(error):
-                        reconnect_session()
-                        continue
-                    print(f"{prefix} ... error: {error}")
-                    wait_for_network(settings)
-                    print(f"{prefix} ... retrying")
+            mark_uploaded(settings, status, rel_path, info, action="uploaded")
+            uploaded_count += 1
+            print(f"{prefix} ... {CHECK} success")
     finally:
+        if watchdog_stop is not None:
+            watchdog_stop.set()
         close_ssh(client, sftp)
 
     print(
@@ -633,10 +728,18 @@ def main() -> int:
         return 1
     except SSHDisconnectedError as error:
         print(f"\n{FAIL} SSH connection failed: {error}")
-        print("Check host, credentials, and server_upload_path in upload_config.json.")
+        print(f"Progress saved in {settings['status_file']}. Restart to resume.")
         return 2
+    except NetworkUnavailableError as error:
+        print(f"\n{FAIL} Network unavailable: {error}")
+        print(f"Progress saved in {settings['status_file']}. Restart to resume.")
+        return 3
+    except TransferStalledError as error:
+        print(f"\n{FAIL} Transfer stalled: {error}")
+        print(f"Progress saved in {settings['status_file']}. Restart to resume.")
+        return 4
     except KeyboardInterrupt:
-        print("\nInterrupted. Progress saved in config.json.")
+        print(f"\nInterrupted. Progress saved in {settings['status_file']}.")
         return 130
 
 

@@ -3,6 +3,8 @@ setlocal
 cd /d "%~dp0"
 
 echo Starting upload...
+echo   Exit codes: 0=ok, 1=auth, 2=SSH lost, 3=network down, 4=stall timeout
+echo   Progress is saved in config.json on exit — restart to resume.
 echo.
 
 if exist "%~dp0upload.bat" (
@@ -23,7 +25,15 @@ if exist "%~dp0upload.bat" (
 
 if not "%EXIT_CODE%"=="0" (
     echo.
-    echo Upload exited with code %EXIT_CODE%.
+    if "%EXIT_CODE%"=="3" (
+        echo Network unavailable. Progress saved — fix connection and run again.
+    ) else if "%EXIT_CODE%"=="4" (
+        echo No data transferred within stall_timeout_seconds. Progress saved — run again.
+    ) else if "%EXIT_CODE%"=="2" (
+        echo SSH session lost. Progress saved — run again to resume.
+    ) else (
+        echo Upload exited with code %EXIT_CODE%.
+    )
 )
 
 endlocal & exit /b %EXIT_CODE%

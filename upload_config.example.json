@@ -8,5 +8,6 @@
   "server_upload_path": "/home/YOUR_USER/public_html/material",
   "status_file": "config.json",
   "network_check_interval_seconds": 10,
-  "ssh_connect_timeout_seconds": 30
+  "ssh_connect_timeout_seconds": 30,
+  "stall_timeout_seconds": 600
 }
