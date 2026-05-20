@@ -1,0 +1,4 @@
+
+I want you to configure cursor that save our conversation as md file to story_cursor when you do git commit for each task. Also append my prompt at the end.
+Md filename can be datetime_shorttitle.md. 
+datetime means current time as yymmdd_hhss. shorttitle means abstraction title for our conversation. shorttitle length should not more than 50 letters.
