@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 upload_config.json
+upload_config.json.bak
 config.json
 config.json.tmp
 config.sqlite
