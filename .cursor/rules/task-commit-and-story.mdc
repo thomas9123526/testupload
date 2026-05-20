@@ -13,7 +13,7 @@ Create `story_cursor/{datetime}_{shorttitle}.md`:
 
 | Part | Format |
 |------|--------|
-| `datetime` | `YYMMDD_HHMM` local time (e.g. `250520_1530`) |
+| `datetime` | `yymmdd_hhss` → `YYMMDD_HHMM` local (e.g. `250521_1530`; year, month, day, hour, minute) |
 | `shorttitle` | ≤50 chars, lowercase, `[a-z0-9_-]` only, words joined with `_` |
 
 **Story body (required sections):**
