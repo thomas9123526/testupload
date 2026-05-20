@@ -4,6 +4,7 @@ Resumable SFTP uploader for the material/ folder.
 
 - Mirrors the local material/ folder tree on the server (same subfolders)
 - Tracks per-file upload status in config.json (including uploaded_success filename list)
+- Caches local SHA-256 scans in cache.json (append-only material/ — skip re-hash for known files)
 - Exits on network/server failure or transfer stall (progress saved in config.json)
 - Skips remote files that match local content (SHA-256 + size)
 """
@@ -121,6 +122,7 @@ def load_settings() -> dict[str, Any]:
         )
         sys.exit(1)
     settings.setdefault("status_file", "config.json")
+    settings.setdefault("scan_cache_file", "cache.json")
     settings.setdefault("network_check_interval_seconds", 10)
     settings.setdefault("ssh_connect_timeout_seconds", 30)
     settings.setdefault("stall_timeout_seconds", 600)
@@ -178,6 +180,79 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def scan_cache_path(settings: dict[str, Any]) -> Path:
+    path = Path(settings["scan_cache_file"])
+    if not path.is_absolute():
+        path = SCRIPT_DIR / path
+    return path
+
+
+def load_scan_cache(settings: dict[str, Any]) -> dict[str, Any]:
+    path = scan_cache_path(settings)
+    if not path.exists():
+        return {"version": 1, "files": {}}
+
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    data.setdefault("version", 1)
+    data.setdefault("files", {})
+    return data
+
+
+def save_scan_cache(settings: dict[str, Any], cache: dict[str, Any]) -> None:
+    path = scan_cache_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(cache, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+def prune_scan_cache(cache: dict[str, Any], known_paths: set[str]) -> None:
+    cache["files"] = {
+        rel_path: record
+        for rel_path, record in cache.get("files", {}).items()
+        if rel_path in known_paths
+    }
+
+
+def local_file_info(
+    rel_path: str,
+    path: Path,
+    status: dict[str, Any],
+    cache: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Return file size/hash; reuse config.json or cache.json when size unchanged."""
+    stat = path.stat()
+    size = stat.st_size
+
+    status_record = status.get("files", {}).get(rel_path)
+    if (
+        status_record
+        and status_record.get("size") == size
+        and status_record.get("sha256")
+    ):
+        return {"size": size, "sha256": status_record["sha256"]}, True
+
+    cache_record = cache.get("files", {}).get(rel_path)
+    if (
+        cache_record
+        and cache_record.get("size") == size
+        and cache_record.get("sha256")
+    ):
+        return {"size": size, "sha256": cache_record["sha256"]}, True
+
+    digest = sha256_file(path)
+    cache.setdefault("files", {})[rel_path] = {
+        "size": size,
+        "sha256": digest,
+        "cached_at": utc_now(),
+    }
+    return {"size": size, "sha256": digest}, False
+
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -187,14 +262,6 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def local_file_info(path: Path) -> dict[str, Any]:
-    stat = path.stat()
-    return {
-        "size": stat.st_size,
-        "sha256": sha256_file(path),
-    }
 
 
 def scan_local_files(local_root: Path) -> list[tuple[str, Path]]:
@@ -613,6 +680,7 @@ def upload_with_retry(
 def process_files(settings: dict[str, Any]) -> int:
     local_root = SCRIPT_DIR / settings["local_dir"]
     status = load_status(settings)
+    cache = load_scan_cache(settings)
     all_files = scan_local_files(local_root)
 
     if not all_files:
@@ -621,14 +689,29 @@ def process_files(settings: dict[str, Any]) -> int:
 
     print("Scanning local files...")
     queue: list[tuple[str, Path, dict[str, Any]]] = []
+    cached_count = 0
+    hashed_count = 0
+    known_paths = {rel_path for rel_path, _ in all_files}
+
     for rel_path, path in all_files:
-        info = local_file_info(path)
+        info, from_cache = local_file_info(rel_path, path, status, cache)
+        if from_cache:
+            cached_count += 1
+        else:
+            hashed_count += 1
         if needs_upload(rel_path, info, status):
             queue.append((rel_path, path, info))
 
+    prune_scan_cache(cache, known_paths)
+    save_scan_cache(settings, cache)
+
     total = len(all_files)
     pending = len(queue)
-    print(f"Found {total} file(s). {pending} need upload/check, {total - pending} already marked uploaded.\n")
+    print(
+        f"Found {total} file(s). "
+        f"{cached_count} from cache, {hashed_count} hashed. "
+        f"{pending} need upload/check, {total - pending} already marked uploaded.\n"
+    )
 
     if pending == 0:
         print("Nothing to do.")

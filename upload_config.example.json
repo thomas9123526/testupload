@@ -7,6 +7,7 @@
   "local_dir": "material",
   "server_upload_path": "/home/YOUR_USER/public_html/material",
   "status_file": "config.json",
+  "scan_cache_file": "cache.json",
   "auto_upload_retry_seconds": 300,
   "network_check_interval_seconds": 10,
   "ssh_connect_timeout_seconds": 30,

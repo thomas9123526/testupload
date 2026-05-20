@@ -4,5 +4,7 @@ __pycache__/
 upload_config.json
 config.json
 config.json.tmp
+cache.json
+cache.json.tmp
 material/**
 !material/.gitkeep
