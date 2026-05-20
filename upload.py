@@ -5,7 +5,7 @@ Resumable SFTP uploader for the material/ folder.
 - Mirrors the local material/ folder tree on the server (same subfolders)
 - Tracks per-file upload status in config.json
 - Retries when the network drops (waits until connectivity returns)
-- Exits immediately if the SSH session is lost (restart manually to resume)
+- Reconnects when the SSH/SFTP session drops and resumes from config.json
 - Skips remote files that match local content (SHA-256 + size)
 """
 
@@ -94,7 +94,7 @@ def load_settings() -> dict[str, Any]:
         print(f"Missing settings in {SETTINGS_FILE.name}: {', '.join(missing)}")
         sys.exit(1)
 
-    settings["server_upload_path"] = upload_path.replace("\\", "/")
+    settings["server_upload_path"] = upload_path.replace("\\", "/").rstrip("/")
     if not settings["server_upload_path"].startswith("/"):
         print(
             f"server_upload_path must be an absolute server path (start with /), "
@@ -228,6 +228,7 @@ def is_ssh_disconnect(error: BaseException) -> bool:
         "connection reset",
         "broken pipe",
         "eof",
+        "channel closed",
         "socket is closed",
         "server connection dropped",
         "transport is not active",
@@ -250,31 +251,71 @@ def wait_for_network(settings: dict[str, Any]) -> None:
             time.sleep(interval)
 
 
-def connect_ssh(settings: dict[str, Any]) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def close_ssh(
+    client: paramiko.SSHClient | None,
+    sftp: paramiko.SFTPClient | None,
+) -> None:
+    if sftp is not None:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
 
-    try:
-        client.connect(
-            hostname=settings["host"],
-            port=int(settings["port"]),
-            username=settings["username"],
-            password=settings["password"],
-            timeout=int(settings["ssh_connect_timeout_seconds"]),
-            banner_timeout=int(settings["ssh_connect_timeout_seconds"]),
-            auth_timeout=int(settings["ssh_connect_timeout_seconds"]),
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        transport = client.get_transport()
-        if transport is not None:
-            transport.set_keepalive(30)
-        sftp = client.open_sftp()
-        return client, sftp
-    except (NoValidConnectionsError, AuthenticationException, SSHException, OSError) as error:
-        if is_ssh_disconnect(error):
+
+def connect_ssh(settings: dict[str, Any]) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
+    """Connect with retries; SFTP-only (no shell) for shared-host compatibility."""
+    max_attempts = 3
+    last_error: BaseException | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            if attempt > 1:
+                print(f"  Retry {attempt}/{max_attempts} ...")
+            client.connect(
+                hostname=settings["host"],
+                port=int(settings["port"]),
+                username=settings["username"],
+                password=settings["password"],
+                timeout=int(settings["ssh_connect_timeout_seconds"]),
+                banner_timeout=int(settings["ssh_connect_timeout_seconds"]),
+                auth_timeout=int(settings["ssh_connect_timeout_seconds"]),
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(30)
+            print("  Opening SFTP session...")
+            sftp = client.open_sftp()
+            return client, sftp
+        except AuthenticationException:
+            close_ssh(client, None)
+            raise
+        except (NoValidConnectionsError, SSHException, OSError) as error:
+            last_error = error
+            close_ssh(client, None)
+            if attempt < max_attempts:
+                time.sleep(min(5 * attempt, 15))
+                continue
+            if is_ssh_disconnect(error):
+                raise SSHDisconnectedError(str(error)) from error
+            raise SSHDisconnectedError(f"Could not open SFTP session: {error}") from error
+        except Exception as error:
+            last_error = error
+            close_ssh(client, None)
+            if attempt < max_attempts:
+                time.sleep(min(5 * attempt, 15))
+                continue
             raise SSHDisconnectedError(str(error)) from error
-        raise
+
+    raise SSHDisconnectedError(str(last_error or "connection failed"))
 
 
 def resolve_remote_path(server_upload_path: str, rel_path: str) -> str:
@@ -341,29 +382,29 @@ def sync_remote_directory_tree(
     print()
 
 
-def remote_file_info(client: paramiko.SSHClient, remote_path: str) -> dict[str, Any] | None:
-    quoted = remote_path.replace("'", "'\"'\"'")
-    command = (
-        f"if [ -f '{quoted}' ]; then "
-        f"stat -c '%s' '{quoted}' && sha256sum '{quoted}' | awk '{{print $1}}'; "
-        f"else echo '__MISSING__'; fi"
-    )
-    _, stdout, stderr = client.exec_command(command)
-    exit_code = stdout.channel.recv_exit_status()
-    if exit_code != 0:
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        raise SSHDisconnectedError(f"Remote check failed for {remote_path}: {err or exit_code}")
-
-    lines = stdout.read().decode("utf-8", errors="replace").splitlines()
-    if not lines or lines[0].strip() == "__MISSING__":
+def remote_file_info(sftp: paramiko.SFTPClient, remote_path: str) -> dict[str, Any] | None:
+    """Compare remote file via SFTP only (avoids extra SSH exec channels on shared hosts)."""
+    try:
+        attr = sftp.stat(remote_path)
+    except OSError:
         return None
 
-    if len(lines) < 2:
-        raise SSHDisconnectedError(f"Unexpected remote check output for {remote_path}")
+    digest = hashlib.sha256()
+    try:
+        with sftp.open(remote_path, "rb") as remote_file:
+            while True:
+                chunk = remote_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except Exception as error:
+        if is_ssh_disconnect(error):
+            raise SSHDisconnectedError(str(error)) from error
+        raise
 
     return {
-        "size": int(lines[0].strip()),
-        "sha256": lines[1].strip(),
+        "size": attr.st_size,
+        "sha256": digest.hexdigest(),
     }
 
 
@@ -439,19 +480,34 @@ def process_files(settings: dict[str, Any]) -> int:
         print("Nothing to do.")
         return 0
 
-    print(f"Connecting to {settings['username']}@{settings['host']}:{settings['port']} ...")
-    client, sftp = connect_ssh(settings)
     server_path = settings["server_upload_path"]
     remote_base = resolve_remote_path(server_path, "")
-    print(f"Connected. Server upload path: {remote_base}\n")
+    client: paramiko.SSHClient | None = None
+    sftp: paramiko.SFTPClient | None = None
 
-    sync_remote_directory_tree(sftp, server_path, local_root)
+    def open_session() -> None:
+        nonlocal client, sftp
+        close_ssh(client, sftp)
+        print(f"Connecting to {settings['username']}@{settings['host']}:{settings['port']} ...")
+        client, sftp = connect_ssh(settings)
+
+    def reconnect_session() -> None:
+        print("\nSSH session lost. Waiting for network, then reconnecting...")
+        wait_for_network(settings)
+        open_session()
+        print(f"Reconnected. Server upload path: {remote_base}\n")
+        sync_remote_directory_tree(sftp, server_path, local_root)
+
+    open_session()
+    print(f"Connected. Server upload path: {remote_base}\n")
 
     uploaded_count = 0
     skipped_count = 0
     processed = 0
 
     try:
+        sync_remote_directory_tree(sftp, server_path, local_root)
+
         for rel_path, local_path, info in queue:
             processed += 1
             remote_path = resolve_remote_path(settings["server_upload_path"], rel_path)
@@ -459,7 +515,7 @@ def process_files(settings: dict[str, Any]) -> int:
 
             while True:
                 try:
-                    remote_info = remote_file_info(client, remote_path)
+                    remote_info = remote_file_info(sftp, remote_path)
                     if (
                         remote_info is not None
                         and remote_info["size"] == info["size"]
@@ -477,7 +533,7 @@ def process_files(settings: dict[str, Any]) -> int:
 
                     upload_with_retry(settings, sftp, local_path, remote_path, info["size"])
 
-                    verify = remote_file_info(client, remote_path)
+                    verify = remote_file_info(sftp, remote_path)
                     if (
                         verify is None
                         or verify["size"] != info["size"]
@@ -491,16 +547,16 @@ def process_files(settings: dict[str, Any]) -> int:
                     break
 
                 except SSHDisconnectedError:
-                    raise
+                    reconnect_session()
                 except Exception as error:
                     if is_ssh_disconnect(error):
-                        raise SSHDisconnectedError(str(error)) from error
+                        reconnect_session()
+                        continue
                     print(f"{prefix} ... error: {error}")
                     wait_for_network(settings)
                     print(f"{prefix} ... retrying")
     finally:
-        sftp.close()
-        client.close()
+        close_ssh(client, sftp)
 
     print(
         f"\nDone. Uploaded: {uploaded_count}, skipped (identical): {skipped_count}, "
@@ -514,8 +570,8 @@ def main() -> int:
     try:
         return process_files(settings)
     except SSHDisconnectedError as error:
-        print(f"\n{FAIL} SSH session lost: {error}")
-        print("Script stopped. Start it again manually to resume from config.json.")
+        print(f"\n{FAIL} SSH connection failed: {error}")
+        print("Check host, credentials, and server_upload_path in upload_config.json.")
         return 2
     except KeyboardInterrupt:
         print("\nInterrupted. Progress saved in config.json.")
