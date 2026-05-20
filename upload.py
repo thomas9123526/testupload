@@ -528,6 +528,14 @@ def format_speed(bytes_per_sec: float) -> str:
     return f"{format_bytes(int(bytes_per_sec))}/s"
 
 
+def format_progress_line(label: str, done: int, total: int, speed: float) -> str:
+    percent = (done / total * 100) if total else 100.0
+    return (
+        f"{label} — {format_bytes(done)} / {format_bytes(total)} "
+        f"({percent:5.1f}%) @ {format_speed(speed)}"
+    )
+
+
 def upload_with_retry(
     settings: dict[str, Any],
     sftp: paramiko.SFTPClient,
@@ -535,6 +543,7 @@ def upload_with_retry(
     remote_path: str,
     total_size: int,
     tracker: TransferTracker,
+    label: str,
 ) -> None:
     ensure_remote_dir(sftp, remote_path)
     start_time = time.time()
@@ -563,13 +572,8 @@ def upload_with_retry(
         speed = instant_speed if last_done > 0 else avg_speed
         last_report = now
         last_done = done
-        percent = (done / total * 100) if total else 100.0
-        print(
-            f"\r      progress: {format_bytes(done)} / {format_bytes(total)} "
-            f"({percent:5.1f}%) @ {format_speed(speed)}",
-            end="",
-            flush=True,
-        )
+        line = format_progress_line(label, done, total, speed)
+        print(f"\r{line}", end="", flush=True)
 
     def do_put() -> None:
         try:
@@ -596,10 +600,8 @@ def upload_with_retry(
 
     elapsed = max(time.time() - start_time, 0.001)
     avg_speed = total_size / elapsed if total_size else 0
-    print(
-        f"\r      progress: {format_bytes(total_size)} / {format_bytes(total_size)} "
-        f"(100.0%) @ {format_speed(avg_speed)} (avg)"
-    )
+    print(f"\r{format_progress_line(label, total_size, total_size, avg_speed)} (avg)")
+    print()
 
 
 def process_files(settings: dict[str, Any]) -> int:
@@ -678,13 +680,8 @@ def process_files(settings: dict[str, Any]) -> int:
                 print(f"{prefix} ... {SKIP} skipped (identical on server)")
                 continue
 
-            if remote_info is not None:
-                print(f"{prefix} ... remote differs, uploading")
-            else:
-                print(f"{prefix} ... uploading")
-
             upload_with_retry(
-                settings, sftp, local_path, remote_path, info["size"], tracker
+                settings, sftp, local_path, remote_path, info["size"], tracker, prefix
             )
 
             verify = remote_file_info(sftp, remote_path, tracker)
