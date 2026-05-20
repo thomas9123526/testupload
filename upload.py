@@ -7,6 +7,7 @@ Resumable SFTP uploader for the material/ folder.
 - Caches local SHA-256 scans in cache.json (append-only material/ — skip re-hash for known files)
 - Exits on network/server failure or transfer stall (progress saved in config.json)
 - Skips remote files that match local content (SHA-256 + size)
+- Optional server-side hash via linux/calculate_hash.py over SSH exec (see server_calculate_hash_script)
 """
 
 from __future__ import annotations
@@ -126,7 +127,25 @@ def load_settings() -> dict[str, Any]:
     settings.setdefault("network_check_interval_seconds", 10)
     settings.setdefault("ssh_connect_timeout_seconds", 30)
     settings.setdefault("stall_timeout_seconds", 600)
+    merge_config_json_settings(settings)
+    script = str(settings.get("server_calculate_hash_script", "")).strip().replace("\\", "/")
+    settings["server_calculate_hash_script"] = script
     return settings
+
+
+def merge_config_json_settings(settings: dict[str, Any]) -> None:
+    """Apply optional keys from local config.json (e.g. server_calculate_hash_script)."""
+    path = status_path(settings)
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if data.get("server_calculate_hash_script"):
+        settings["server_calculate_hash_script"] = str(
+            data["server_calculate_hash_script"]
+        ).strip()
 
 
 def status_path(settings: dict[str, Any]) -> Path:
@@ -621,13 +640,87 @@ def sync_remote_directory_tree(
     print()
 
 
-def remote_file_info(
+def connect_exec_client(settings: dict[str, Any]) -> paramiko.SSHClient:
+    """SSH connection for remote commands only (separate from SFTP session)."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(**ssh_connect_kwargs(settings))
+    transport = client.get_transport()
+    if transport is not None:
+        transport.set_keepalive(30)
+    return client
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def remote_file_info_via_script(
+    exec_client: paramiko.SSHClient,
+    script_path: str,
+    remote_path: str,
+    settings: dict[str, Any],
+    tracker: TransferTracker | None = None,
+    label: str = "",
+) -> dict[str, Any] | None:
+    """Run calculate_hash.py on the server via SSH exec (not SFTP)."""
+    display = label or remote_path
+    if tracker is not None:
+        tracker.set_activity("Server hash script running", display)
+        tracker.touch()
+
+    timeout = int(settings["ssh_connect_timeout_seconds"])
+    quoted_script = shell_quote(script_path)
+    quoted_file = shell_quote(remote_path)
+    last_error = ""
+
+    for python_bin in ("python3", "python"):
+        command = f"{python_bin} {quoted_script} {quoted_file}"
+        try:
+            _, stdout, stderr = exec_client.exec_command(command, timeout=timeout)
+            exit_code = stdout.channel.recv_exit_status()
+            output = stdout.read().decode("utf-8", errors="replace").strip()
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+        except Exception as error:
+            last_error = str(error)
+            if is_ssh_disconnect(error):
+                raise SSHDisconnectedError(str(error)) from error
+            continue
+
+        if exit_code != 0:
+            last_error = err or output or f"exit {exit_code}"
+            if "not_found" in output or exit_code == 1:
+                return None
+            continue
+
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError:
+            last_error = f"invalid JSON from server script: {output[:200]}"
+            continue
+
+        if data.get("error") == "not_found":
+            return None
+
+        if "size" in data and "sha256" in data:
+            if tracker is not None:
+                tracker.note(len(output.encode("utf-8")))
+            return {"size": int(data["size"]), "sha256": str(data["sha256"])}
+
+        last_error = f"unexpected script output: {output[:200]}"
+
+    raise RuntimeError(
+        f"Server hash script failed for {remote_path}: {last_error or 'unknown error'}"
+    )
+
+
+def remote_file_info_via_sftp(
     sftp: paramiko.SFTPClient,
     remote_path: str,
     tracker: TransferTracker | None = None,
     label: str = "",
 ) -> dict[str, Any] | None:
-    """Compare remote file via SFTP only (avoids extra SSH exec channels on shared hosts)."""
+    """Download file over SFTP and hash locally (fallback when server script unavailable)."""
     display = label or remote_path
     if tracker is not None:
         tracker.set_activity("Checking remote file on server", display)
@@ -639,7 +732,7 @@ def remote_file_info(
     digest = hashlib.sha256()
     try:
         if tracker is not None:
-            tracker.set_activity("Reading remote file hash", display)
+            tracker.set_activity("Reading remote file hash (SFTP)", display)
         with sftp.open(remote_path, "rb") as remote_file:
             while True:
                 if tracker is not None:
@@ -661,6 +754,39 @@ def remote_file_info(
         "size": attr.st_size,
         "sha256": digest.hexdigest(),
     }
+
+
+def remote_file_info(
+    sftp: paramiko.SFTPClient,
+    remote_path: str,
+    tracker: TransferTracker | None = None,
+    label: str = "",
+    *,
+    settings: dict[str, Any] | None = None,
+    exec_client: paramiko.SSHClient | None = None,
+    use_server_hash_script: bool = False,
+) -> dict[str, Any] | None:
+    script_path = ""
+    if settings is not None:
+        script_path = str(settings.get("server_calculate_hash_script", "")).strip()
+
+    if use_server_hash_script and exec_client is not None and script_path:
+        try:
+            return remote_file_info_via_script(
+                exec_client,
+                script_path,
+                remote_path,
+                settings,
+                tracker,
+                label,
+            )
+        except (SSHDisconnectedError, TransferStalledError):
+            raise
+        except Exception as error:
+            print(f"  {FAIL} Server hash script failed: {error}")
+            print("  Falling back to SFTP hash for this file.")
+
+    return remote_file_info_via_sftp(sftp, remote_path, tracker, label)
 
 
 def format_bytes(num: int) -> str:
@@ -805,12 +931,19 @@ def process_files(settings: dict[str, Any]) -> int:
     remote_base = resolve_remote_path(server_path, "")
     client: paramiko.SSHClient | None = None
     sftp: paramiko.SFTPClient | None = None
+    exec_client: paramiko.SSHClient | None = None
+    use_server_hash_script = False
     tracker = TransferTracker(int(settings["stall_timeout_seconds"]))
     watchdog_stop: threading.Event | None = None
+    hash_script = str(settings.get("server_calculate_hash_script", "")).strip()
 
     def open_session() -> None:
-        nonlocal client, sftp, watchdog_stop
+        nonlocal client, sftp, exec_client, use_server_hash_script, watchdog_stop
         close_ssh(client, sftp)
+        if exec_client is not None:
+            close_ssh(exec_client, None)
+            exec_client = None
+        use_server_hash_script = False
         if watchdog_stop is not None:
             watchdog_stop.set()
         tracker.set_activity(
@@ -822,8 +955,30 @@ def process_files(settings: dict[str, Any]) -> int:
         client, sftp = connect_ssh(settings, tracker)
         tracker.touch()
 
+        if hash_script:
+            if not hash_script.startswith("/"):
+                print(
+                    f"{FAIL} server_calculate_hash_script must be an absolute path, "
+                    f"got: {hash_script!r}"
+                )
+            else:
+                try:
+                    sftp.stat(hash_script)
+                    exec_client = connect_exec_client(settings)
+                    use_server_hash_script = True
+                    print(f"Server hash script: {hash_script}")
+                except OSError:
+                    print(f"{FAIL} Server hash script not found: {hash_script}")
+                    print("  Upload linux/calculate_hash.py to that path on the server.")
+                    print("  Falling back to SFTP hash (slower for large files).")
+                except Exception as error:
+                    print(f"{FAIL} Could not open SSH exec session for hash script: {error}")
+                    print("  Falling back to SFTP hash.")
+
         def on_stall() -> None:
             close_ssh(client, sftp)
+            if exec_client is not None:
+                close_ssh(exec_client, None)
 
         watchdog_stop = tracker.start_watchdog(on_stall=on_stall)
 
@@ -845,7 +1000,15 @@ def process_files(settings: dict[str, Any]) -> int:
             prefix = f"[{processed}/{pending}] {rel_path}"
 
             tracker.set_activity("Pending", f"compare with server: {rel_path}")
-            remote_info = remote_file_info(sftp, remote_path, tracker, label=prefix)
+            remote_info = remote_file_info(
+                sftp,
+                remote_path,
+                tracker,
+                label=prefix,
+                settings=settings,
+                exec_client=exec_client,
+                use_server_hash_script=use_server_hash_script,
+            )
             if (
                 remote_info is not None
                 and remote_info["size"] == info["size"]
@@ -861,7 +1024,15 @@ def process_files(settings: dict[str, Any]) -> int:
             )
 
             tracker.set_activity("Verifying upload", prefix)
-            verify = remote_file_info(sftp, remote_path, tracker, label=prefix)
+            verify = remote_file_info(
+                sftp,
+                remote_path,
+                tracker,
+                label=prefix,
+                settings=settings,
+                exec_client=exec_client,
+                use_server_hash_script=use_server_hash_script,
+            )
             if (
                 verify is None
                 or verify["size"] != info["size"]
@@ -877,6 +1048,8 @@ def process_files(settings: dict[str, Any]) -> int:
             watchdog_stop.set()
         tracker.clear_countdown()
         close_ssh(client, sftp)
+        if exec_client is not None:
+            close_ssh(exec_client, None)
 
     print(
         f"\nDone. Uploaded: {uploaded_count}, skipped (identical): {skipped_count}, "
