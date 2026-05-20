@@ -37,14 +37,14 @@ Create `story_cursor/{datetime}_{shorttitle}.md`:
 {paste the user's exact message for this task, verbatim}
 ```
 
-- Do not include passwords, API keys, or secrets from `upload_config.json`.
+- Do not include passwords, API keys, or secrets from `config.json`.
 - Skip story + commit if the task was **questions only** with **no file changes**.
 
 ## 2. Git commit
 
 When there are changes to commit:
 
-1. `git status` and `git diff` — never commit `.env`, `upload_config.json`, or credentials.
+1. `git status` and `git diff` — never commit `.env`, `config.json`, or credentials.
 2. Stage only relevant files **including** the new story markdown.
 3. Commit with a message that reports what was done (1–2 sentences, focus on why).
 

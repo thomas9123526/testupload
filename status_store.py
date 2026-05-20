@@ -202,31 +202,40 @@ def resolve_status_db_path(settings: dict[str, Any], script_dir: Path = SCRIPT_D
     return path.with_suffix(".sqlite")
 
 
-def status_json_path(settings: dict[str, Any], script_dir: Path = SCRIPT_DIR) -> Path:
-    path = Path(settings["status_file"])
-    if not path.is_absolute():
-        path = script_dir / path
-    if path.suffix.lower() == ".json":
+def legacy_files_json_path(script_dir: Path = SCRIPT_DIR) -> Path | None:
+    """Legacy per-file progress lived under config.json 'files' before config.sqlite."""
+    path = script_dir / "config.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if data.get("files"):
         return path
-    return path.with_suffix(".json")
+    return None
 
 
 def open_status_store(settings: dict[str, Any], script_dir: Path = SCRIPT_DIR) -> StatusStore:
     db_path = resolve_status_db_path(settings, script_dir)
-    json_path = status_json_path(settings, script_dir)
     store = StatusStore(db_path)
-    if json_path.is_file():
+    legacy_files = legacy_files_json_path(script_dir)
+    if legacy_files is not None:
         migrate = not db_path.is_file()
         if not migrate:
             try:
-                migrate = json_path.stat().st_mtime > db_path.stat().st_mtime
+                migrate = legacy_files.stat().st_mtime > db_path.stat().st_mtime
             except OSError:
                 migrate = False
         if migrate:
-            count = store.migrate_from_json(json_path)
-            print(f"Migrated {count} file record(s) from {json_path.name} -> {db_path.name}")
+            count = store.migrate_from_json(legacy_files)
+            print(
+                f"Migrated {count} file record(s) from legacy {legacy_files.name} "
+                f"files[] -> {db_path.name}"
+            )
     if store.get_meta("auto_upload_retry_seconds") is None:
-        store.set_meta("auto_upload_retry_seconds", DEFAULT_RETRY_SECONDS)
+        retry = settings.get("auto_upload_retry_seconds", DEFAULT_RETRY_SECONDS)
+        store.set_meta("auto_upload_retry_seconds", retry)
     return store
 
 
@@ -234,44 +243,26 @@ def read_auto_upload_retry_seconds(
     settings: dict[str, Any] | None = None,
     script_dir: Path = SCRIPT_DIR,
 ) -> int:
-    """Read retry interval from status store (SQLite or legacy JSON)."""
+    """Read retry interval from config.json or config.sqlite meta."""
+    config_path = script_dir / "config.json"
+    if config_path.is_file():
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            if "auto_upload_retry_seconds" in data:
+                return max(1, int(data["auto_upload_retry_seconds"]))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            pass
+
     if settings:
         db_path = resolve_status_db_path(settings, script_dir)
-        if db_path.is_file():
-            store = StatusStore(db_path)
-            try:
-                value = store.get_meta("auto_upload_retry_seconds")
-                if value is not None:
-                    return max(1, int(value))
-            finally:
-                store.close()
-        json_path = status_json_path(settings, script_dir)
-        if json_path.is_file():
-            try:
-                data = json.loads(json_path.read_text(encoding="utf-8"))
-                if "auto_upload_retry_seconds" in data:
-                    return max(1, int(data["auto_upload_retry_seconds"]))
-            except (json.JSONDecodeError, OSError, TypeError, ValueError):
-                pass
-        return DEFAULT_RETRY_SECONDS
-
-    for name in ("config.sqlite", "config.json"):
-        path = script_dir / name
-        if not path.is_file():
-            continue
-        if path.suffix == ".sqlite":
-            store = StatusStore(path)
-            try:
-                value = store.get_meta("auto_upload_retry_seconds")
-                if value is not None:
-                    return max(1, int(value))
-            finally:
-                store.close()
-        else:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if "auto_upload_retry_seconds" in data:
-                    return max(1, int(data["auto_upload_retry_seconds"]))
-            except (json.JSONDecodeError, OSError, TypeError, ValueError):
-                pass
+    else:
+        db_path = script_dir / "config.sqlite"
+    if db_path.is_file():
+        store = StatusStore(db_path)
+        try:
+            value = store.get_meta("auto_upload_retry_seconds")
+            if value is not None:
+                return max(1, int(value))
+        finally:
+            store.close()
     return DEFAULT_RETRY_SECONDS

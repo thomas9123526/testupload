@@ -1,14 +1,24 @@
 {
-  "_note": "Meta for upload.py. Per-file progress lives in config.sqlite. config.json is migrated on first run.",
   "version": 1,
+  "host": "64.20.33.250",
+  "port": 22,
+  "username": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD_HERE",
+  "private_key_path": "",
   "local_dir": "C:/Users/YOUR_NAME/path/to/upload",
-  "auto_upload_retry_seconds": 300,
+  "server_upload_path": "/home/YOUR_USER/public_html/upload",
   "server_calculate_hash_script": "/home/YOUR_USER/calculate_hash.py",
+  "status_file": "config.sqlite",
+  "scan_cache_file": "cache.json",
+  "auto_upload_retry_seconds": 300,
+  "network_check_interval_seconds": 10,
+  "ssh_connect_timeout_seconds": 30,
+  "stall_timeout_seconds": 600,
+  "loop_upload_interval": 300,
   "ignore": [
     ".git",
     ".gradle",
     "build",
-    "*.tmp",
-    "platforms/android-33"
+    "*.tmp"
   ]
 }

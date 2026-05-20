@@ -86,7 +86,7 @@ def ensure_config_default() -> None:
 
 def error_message(exit_code: int) -> str:
     messages = {
-        1: "Upload failed: authentication error (exit 1). Check upload_config.json credentials.",
+        1: "Upload failed: authentication error (exit 1). Check config.json credentials.",
         2: "Upload failed: SSH connection lost (exit 2). Progress saved in config.sqlite.",
         3: "Upload failed: network unavailable (exit 3). Progress saved in config.sqlite.",
         4: "Upload failed: transfer stalled - no data moved (exit 4). Progress saved in config.sqlite.",

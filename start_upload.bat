@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 echo Starting upload...
 echo   Exit codes: 0=ok, 1=auth, 2=SSH lost, 3=network down, 4=stall timeout
-echo   Progress is saved in config.json on exit — restart to resume.
+echo   Progress is saved in config.sqlite on exit — restart to resume.
 echo.
 
 if exist "%~dp0upload.bat" (

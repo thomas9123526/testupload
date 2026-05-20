@@ -2,7 +2,7 @@
 """
 Resumable SFTP uploader for the material/ folder.
 
-- Uploads all files under local_dir (upload_config.json or status store meta)
+- Uploads all files under local_dir (config.json); per-file progress in config.sqlite
 - Mirrors the local folder tree on the server (same subfolders)
 - Tracks per-file upload status in SQLite (config.sqlite; migrates from config.json)
 - Streaming pipeline: scan, hash, cache, upload threads (bounded queues, lazy remote mkdir)
@@ -35,7 +35,6 @@ from status_store import (
     open_status_store,
     read_auto_upload_retry_seconds,
     resolve_status_db_path,
-    status_json_path,
 )
 
 
@@ -79,7 +78,9 @@ except ImportError:
         print("Then: .\\.venv\\Scripts\\pip.exe install -r requirements.txt")
     sys.exit(1)
 
-SETTINGS_FILE = SCRIPT_DIR / "upload_config.json"
+SETTINGS_FILE = SCRIPT_DIR / "config.json"
+LEGACY_SETTINGS_FILE = SCRIPT_DIR / "upload_config.json"
+SETTINGS_EXAMPLE = SCRIPT_DIR / "config.example.json"
 LOCAL_HASH_SCRIPT = SCRIPT_DIR / "linux" / "calculate_hash.py"
 CHECK = "\u2713"  # ✓
 SKIP = "\u2298"   # ⊘
@@ -102,16 +103,55 @@ class ServerHashScriptError(Exception):
     """Raised when server calculate_hash.py is required but unavailable."""
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return data
+
+
+def merge_legacy_upload_config(settings: dict[str, Any]) -> bool:
+    """Fill missing keys from upload_config.json (legacy) without overriding config.json."""
+    if not LEGACY_SETTINGS_FILE.is_file():
+        return False
+    try:
+        legacy = _read_json_object(LEGACY_SETTINGS_FILE)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return False
+
+    skip_keys = {"files", "uploaded_success", "version", "_note"}
+    merged = False
+    for key, value in legacy.items():
+        if key in skip_keys or value is None:
+            continue
+        if key not in settings or settings[key] in ("", None, []):
+            settings[key] = value
+            merged = True
+    if merged:
+        print(
+            f"Note: filled missing settings from legacy {LEGACY_SETTINGS_FILE.name}. "
+            f"Move all keys into {SETTINGS_FILE.name} and delete {LEGACY_SETTINGS_FILE.name}."
+        )
+    return merged
+
+
 def load_settings() -> dict[str, Any]:
-    if not SETTINGS_FILE.exists():
-        example = SCRIPT_DIR / "upload_config.example.json"
+    if SETTINGS_FILE.exists():
+        settings = _read_json_object(SETTINGS_FILE)
+    elif LEGACY_SETTINGS_FILE.exists():
+        settings = _read_json_object(LEGACY_SETTINGS_FILE)
+        print(
+            f"Using legacy {LEGACY_SETTINGS_FILE.name}. "
+            f"Copy to {SETTINGS_FILE.name} (see {SETTINGS_EXAMPLE.name})."
+        )
+    else:
         print(f"Settings file not found: {SETTINGS_FILE}")
-        if example.exists():
-            print(f"Copy {example.name} to {SETTINGS_FILE.name} and edit it.")
+        if SETTINGS_EXAMPLE.exists():
+            print(f"Copy {SETTINGS_EXAMPLE.name} to {SETTINGS_FILE.name} and edit it.")
         sys.exit(1)
 
-    with SETTINGS_FILE.open("r", encoding="utf-8") as handle:
-        settings = json.load(handle)
+    merge_legacy_upload_config(settings)
 
     required = ("host", "port", "username")
     missing = [key for key in required if not settings.get(key)]
@@ -145,10 +185,11 @@ def load_settings() -> dict[str, Any]:
     settings.setdefault("network_check_interval_seconds", 10)
     settings.setdefault("ssh_connect_timeout_seconds", 30)
     settings.setdefault("stall_timeout_seconds", 600)
-    merge_config_json_settings(settings)
+    settings.setdefault("auto_upload_retry_seconds", 300)
+
     if not str(settings.get("local_dir", "")).strip():
         print(
-            f"Missing local_dir: set it in {settings['status_file']} or {SETTINGS_FILE.name} "
+            f"Missing local_dir in {SETTINGS_FILE.name} "
             f"(absolute path, or relative to project; on Windows use C:/path or C:\\\\path in JSON)."
         )
         sys.exit(1)
@@ -156,8 +197,8 @@ def load_settings() -> dict[str, Any]:
     settings["server_calculate_hash_script"] = script
     if not script:
         print(
-            f"Missing server_calculate_hash_script in {SETTINGS_FILE.name} or "
-            f"{settings['status_file']} (absolute path to calculate_hash.py on server)."
+            f"Missing server_calculate_hash_script in {SETTINGS_FILE.name} "
+            f"(absolute path to calculate_hash.py on server)."
         )
         sys.exit(1)
     if not script.startswith("/"):
@@ -167,40 +208,6 @@ def load_settings() -> dict[str, Any]:
         )
         sys.exit(1)
     return settings
-
-
-def merge_config_json_settings(settings: dict[str, Any]) -> None:
-    """Apply optional keys from status store (local_dir, server_calculate_hash_script)."""
-    db_path = resolve_status_db_path(settings)
-    if db_path.is_file():
-        store = StatusStore(db_path)
-        try:
-            if store.get_meta("local_dir"):
-                settings["local_dir"] = str(store.get_meta("local_dir")).strip()
-            if store.get_meta("server_calculate_hash_script"):
-                settings["server_calculate_hash_script"] = str(
-                    store.get_meta("server_calculate_hash_script")
-                ).strip()
-            if store.get_meta("ignore") is not None:
-                settings["ignore"] = store.get_meta("ignore")
-        finally:
-            store.close()
-
-    json_path = status_json_path(settings)
-    if not json_path.is_file():
-        return
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-    if data.get("local_dir"):
-        settings["local_dir"] = str(data["local_dir"]).strip()
-    if data.get("server_calculate_hash_script"):
-        settings["server_calculate_hash_script"] = str(
-            data["server_calculate_hash_script"]
-        ).strip()
-    if data.get("ignore") is not None:
-        settings["ignore"] = data["ignore"]
 
 
 def normalize_ignore_patterns(raw: Any) -> list[str]:
@@ -245,14 +252,9 @@ def path_matches_ignore(rel_path: str, patterns: list[str]) -> bool:
     return False
 
 
-def load_ignore_patterns(
-    settings: dict[str, Any],
-    status: StatusStore,
-) -> list[str]:
-    """Load ignore list (config.json overrides sqlite meta via merge_config_json_settings)."""
-    if settings.get("ignore") is not None:
-        return normalize_ignore_patterns(settings["ignore"])
-    return normalize_ignore_patterns(status.get_meta("ignore"))
+def load_ignore_patterns(settings: dict[str, Any]) -> list[str]:
+    """Load ignore list from config.json."""
+    return normalize_ignore_patterns(settings.get("ignore"))
 
 
 def local_root_path(settings: dict[str, Any]) -> Path:
@@ -1010,7 +1012,7 @@ class TransferTracker:
             where = f"{activity}: {detail}" if detail else activity
             raise TransferStalledError(
                 f"No data transferred for {int(idle)}s while {where} "
-                f"(limit: {self.timeout_seconds}s in upload_config.json)"
+                f"(limit: {self.timeout_seconds}s in config.json)"
             )
 
     def start_watchdog(
@@ -1395,7 +1397,7 @@ def upload_with_retry(
         if tracker.aborted:
             raise TransferStalledError(
                 f"No data transferred for {settings['stall_timeout_seconds']}s "
-                f"(limit in upload_config.json)"
+                f"(limit in config.json)"
             )
         tracker.check()
         now = time.time()
@@ -1466,7 +1468,7 @@ def _process_files(
     status: StatusStore,
 ) -> int:
     cache = load_scan_cache(settings)
-    ignore_patterns = load_ignore_patterns(settings, status)
+    ignore_patterns = load_ignore_patterns(settings)
     if ignore_patterns:
         status.set_meta("ignore", ignore_patterns)
 
@@ -1640,7 +1642,7 @@ def main() -> int:
             f"\n{FAIL} SSH authentication failed for "
             f"{settings['username']}@{settings['host']}:{settings['port']} ({auth})."
         )
-        print(f"Check {auth} in {SETTINGS_FILE.name}.")
+        print(f"Check {auth} in {SETTINGS_FILE.name} (password or private_key_path).")
         print("Confirm SFTP/SSH login works in FileZilla or: ssh user@host")
         return 1
     except SSHDisconnectedError as error:
