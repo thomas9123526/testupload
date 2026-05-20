@@ -3,22 +3,23 @@
 Run upload.py in a loop until success.
 
 - Exit 0 from upload.py → print green success and stop
-- Any error → print red reason, countdown (auto_upload_retry_seconds from config.json), retry
+- Any error → print red reason, countdown (auto_upload_retry_seconds from config.sqlite), retry
 - Press any key during countdown → retry immediately
 - Ctrl+C → stop (exit 130)
 """
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from status_store import StatusStore, read_auto_upload_retry_seconds
+
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_JSON = SCRIPT_DIR / "config.json"
+CONFIG_SQLITE = SCRIPT_DIR / "config.sqlite"
 UPLOAD_PY = SCRIPT_DIR / "upload.py"
 DEFAULT_RETRY_SECONDS = 300
 
@@ -68,43 +69,32 @@ def cprint(message: str, color: str) -> None:
 
 
 def read_retry_seconds() -> int:
-    if CONFIG_JSON.is_file():
-        try:
-            data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
-            value = data.get("auto_upload_retry_seconds", DEFAULT_RETRY_SECONDS)
-            return max(1, int(value))
-        except (json.JSONDecodeError, OSError, TypeError, ValueError):
-            pass
-    return DEFAULT_RETRY_SECONDS
+    return read_auto_upload_retry_seconds(script_dir=SCRIPT_DIR)
 
 
 def ensure_config_default() -> None:
-    """Ensure config.json contains auto_upload_retry_seconds default."""
-    if not CONFIG_JSON.is_file():
+    """Ensure status store has auto_upload_retry_seconds default."""
+    if not CONFIG_SQLITE.is_file():
         return
+    store = StatusStore(CONFIG_SQLITE)
     try:
-        data = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
-        if "auto_upload_retry_seconds" not in data:
-            data["auto_upload_retry_seconds"] = DEFAULT_RETRY_SECONDS
-            CONFIG_JSON.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-    except (json.JSONDecodeError, OSError):
-        pass
+        if store.get_meta("auto_upload_retry_seconds") is None:
+            store.set_meta("auto_upload_retry_seconds", DEFAULT_RETRY_SECONDS)
+    finally:
+        store.close()
 
 
 def error_message(exit_code: int) -> str:
     messages = {
         1: "Upload failed: authentication error (exit 1). Check upload_config.json credentials.",
-        2: "Upload failed: SSH connection lost (exit 2). Progress saved in config.json.",
-        3: "Upload failed: network unavailable (exit 3). Progress saved in config.json.",
-        4: "Upload failed: transfer stalled - no data moved (exit 4). Progress saved in config.json.",
+        2: "Upload failed: SSH connection lost (exit 2). Progress saved in config.sqlite.",
+        3: "Upload failed: network unavailable (exit 3). Progress saved in config.sqlite.",
+        4: "Upload failed: transfer stalled - no data moved (exit 4). Progress saved in config.sqlite.",
         130: "Upload interrupted (Ctrl+C). Auto upload stopped.",
     }
     return messages.get(
         exit_code,
-        f"Upload failed with exit code {exit_code}. Progress saved in config.json.",
+        f"Upload failed with exit code {exit_code}. Progress saved in config.sqlite.",
     )
 
 
@@ -207,7 +197,7 @@ def main() -> int:
         cprint(error_message(exit_code), RED)
 
         interval = read_retry_seconds()
-        print(f"Retry interval: {interval}s (config.json: auto_upload_retry_seconds)")
+        print(f"Retry interval: {interval}s (config.sqlite: auto_upload_retry_seconds)")
 
         try:
             countdown(interval)

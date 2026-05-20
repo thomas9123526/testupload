@@ -4,6 +4,9 @@ __pycache__/
 upload_config.json
 config.json
 config.json.tmp
+config.sqlite
+config.sqlite-wal
+config.sqlite-shm
 cache.json
 cache.json.tmp
 material/**

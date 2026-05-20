@@ -2,12 +2,12 @@
 """
 Resumable SFTP uploader for the material/ folder.
 
-- Uploads all files under local_dir (upload_config.json or config.json)
+- Uploads all files under local_dir (upload_config.json or status store meta)
 - Mirrors the local folder tree on the server (same subfolders)
-- Tracks per-file upload status in config.json (including uploaded_success filename list)
+- Tracks per-file upload status in SQLite (config.sqlite; migrates from config.json)
 - Streaming pipeline: scan, hash, cache, upload threads (bounded queues, lazy remote mkdir)
 - Caches local SHA-256 scans in cache.json incrementally while hashing
-- Exits on network/server failure or transfer stall (progress saved in config.json)
+- Exits on network/server failure or transfer stall (progress saved in config.sqlite)
 - Skips remote files that match local content (SHA-256 + size)
 - Server-side hash via linux/calculate_hash.py only (required; auto-deployed if missing)
 """
@@ -28,6 +28,14 @@ from queue import Queue
 from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+from status_store import (
+    StatusStore,
+    open_status_store,
+    read_auto_upload_retry_seconds,
+    resolve_status_db_path,
+    status_json_path,
+)
 
 
 def _reexec_in_project_venv() -> None:
@@ -131,7 +139,7 @@ def load_settings() -> dict[str, Any]:
             f"got: {settings['server_upload_path']!r}"
         )
         sys.exit(1)
-    settings.setdefault("status_file", "config.json")
+    settings.setdefault("status_file", "config.sqlite")
     settings.setdefault("scan_cache_file", "cache.json")
     settings.setdefault("network_check_interval_seconds", 10)
     settings.setdefault("ssh_connect_timeout_seconds", 30)
@@ -161,12 +169,26 @@ def load_settings() -> dict[str, Any]:
 
 
 def merge_config_json_settings(settings: dict[str, Any]) -> None:
-    """Apply optional keys from local config.json (local_dir, server_calculate_hash_script)."""
-    path = status_path(settings)
-    if not path.is_file():
+    """Apply optional keys from status store (local_dir, server_calculate_hash_script)."""
+    db_path = resolve_status_db_path(settings)
+    if db_path.is_file():
+        store = StatusStore(db_path)
+        try:
+            if store.get_meta("local_dir"):
+                settings["local_dir"] = str(store.get_meta("local_dir")).strip()
+            if store.get_meta("server_calculate_hash_script"):
+                settings["server_calculate_hash_script"] = str(
+                    store.get_meta("server_calculate_hash_script")
+                ).strip()
+        finally:
+            store.close()
+        return
+
+    json_path = status_json_path(settings)
+    if not json_path.is_file():
         return
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(json_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return
     if data.get("local_dir"):
@@ -191,46 +213,6 @@ def status_path(settings: dict[str, Any]) -> Path:
     if not path.is_absolute():
         path = SCRIPT_DIR / path
     return path
-
-
-def sync_uploaded_success_list(status: dict[str, Any]) -> None:
-    """Rebuild flat list of successfully uploaded filenames for config.json."""
-    status["uploaded_success"] = sorted(
-        rel_path
-        for rel_path, record in status.get("files", {}).items()
-        if record.get("status") == "uploaded"
-    )
-
-
-def load_status(settings: dict[str, Any]) -> dict[str, Any]:
-    path = status_path(settings)
-    if not path.exists():
-        return {
-            "version": 1,
-            "auto_upload_retry_seconds": 300,
-            "uploaded_success": [],
-            "files": {},
-        }
-
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    data.setdefault("version", 1)
-    data.setdefault("files", {})
-    data.setdefault("auto_upload_retry_seconds", 300)
-    sync_uploaded_success_list(data)
-    return data
-
-
-def save_status(settings: dict[str, Any], status: dict[str, Any]) -> None:
-    sync_uploaded_success_list(status)
-    path = status_path(settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(status, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
-    tmp_path.replace(path)
 
 
 def utc_now() -> str:
@@ -278,14 +260,14 @@ def prune_scan_cache(cache: dict[str, Any], known_paths: set[str]) -> None:
 def resolve_local_file_info(
     rel_path: str,
     path: Path,
-    status: dict[str, Any],
+    status: StatusStore,
     cache: dict[str, Any],
 ) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
     """Return (info, from_cache, new_cache_entry). Caller persists new_cache_entry."""
     stat = path.stat()
     size = stat.st_size
 
-    status_record = status.get("files", {}).get(rel_path)
+    status_record = status.get_file(rel_path)
     if (
         status_record
         and status_record.get("size") == size
@@ -407,7 +389,7 @@ class PipelineProgress:
 @dataclass
 class UploadPipeline:
     settings: dict[str, Any]
-    status: dict[str, Any]
+    status: StatusStore
     cache: dict[str, Any]
     progress: PipelineProgress
     local_root: Path
@@ -506,7 +488,7 @@ def pipeline_hash_worker(pipeline: UploadPipeline) -> None:
         new_entry = None
         from_cache = False
 
-        status_record = pipeline.status.get("files", {}).get(rel_path)
+        status_record = pipeline.status.get_file(rel_path)
         if (
             status_record
             and status_record.get("size") == size
@@ -650,7 +632,6 @@ def pipeline_upload_worker(
             ):
                 with pipeline.status_lock:
                     mark_uploaded(
-                        pipeline.settings,
                         pipeline.status,
                         rel_path,
                         job.info,
@@ -701,7 +682,6 @@ def pipeline_upload_worker(
 
             with pipeline.status_lock:
                 mark_uploaded(
-                    pipeline.settings,
                     pipeline.status,
                     rel_path,
                     job.info,
@@ -774,8 +754,8 @@ def scan_local_directories(local_root: Path) -> list[str]:
     return sorted(directories, key=lambda value: (value.count("/"), value))
 
 
-def needs_upload(rel_path: str, info: dict[str, Any], status: dict[str, Any]) -> bool:
-    record = status["files"].get(rel_path)
+def needs_upload(rel_path: str, info: dict[str, Any], status: StatusStore) -> bool:
+    record = status.get_file(rel_path)
     if not record:
         return True
     if record.get("status") != "uploaded":
@@ -788,20 +768,21 @@ def needs_upload(rel_path: str, info: dict[str, Any], status: dict[str, Any]) ->
 
 
 def mark_uploaded(
-    settings: dict[str, Any],
-    status: dict[str, Any],
+    status: StatusStore,
     rel_path: str,
     info: dict[str, Any],
     action: str,
 ) -> None:
-    status["files"][rel_path] = {
-        "status": "uploaded",
-        "size": info["size"],
-        "sha256": info["sha256"],
-        "action": action,
-        "updated_at": utc_now(),
-    }
-    save_status(settings, status)
+    status.upsert_file(
+        rel_path,
+        {
+            "status": "uploaded",
+            "size": info["size"],
+            "sha256": info["sha256"],
+            "action": action,
+            "updated_at": utc_now(),
+        },
+    )
 
 
 def is_ssh_disconnect(error: BaseException) -> bool:
@@ -1353,7 +1334,18 @@ def upload_with_retry(
 
 def process_files(settings: dict[str, Any]) -> int:
     local_root = local_root_path(settings)
-    status = load_status(settings)
+    status = open_status_store(settings)
+    try:
+        return _process_files(settings, local_root, status)
+    finally:
+        status.close()
+
+
+def _process_files(
+    settings: dict[str, Any],
+    local_root: Path,
+    status: StatusStore,
+) -> int:
     cache = load_scan_cache(settings)
 
     print(f"Local upload folder: {local_root}")
@@ -1451,6 +1443,14 @@ def process_files(settings: dict[str, Any]) -> int:
         watchdog_stop = tracker.start_watchdog(on_stall=on_stall)
 
     try:
+        if settings.get("local_dir"):
+            status.set_meta("local_dir", settings["local_dir"])
+        if settings.get("server_calculate_hash_script"):
+            status.set_meta(
+                "server_calculate_hash_script",
+                settings["server_calculate_hash_script"],
+            )
+
         open_session()
         assert sftp is not None and exec_client is not None
         print(f"Connected. Server upload path: {remote_base}")
@@ -1499,9 +1499,10 @@ def process_files(settings: dict[str, Any]) -> int:
         f"\nDone. Scanned: {total}, uploaded: {uploaded_count}, "
         f"skipped (identical): {skipped_count}, local_dir: {settings['local_dir']}"
     )
-    success_list = status.get("uploaded_success", [])
-    if success_list:
-        print(f"Successful files in {settings['status_file']}: {len(success_list)}")
+    uploaded_in_db = status.count_uploaded()
+    if uploaded_in_db:
+        db_name = resolve_status_db_path(settings).name
+        print(f"Successful files in {db_name}: {uploaded_in_db}")
     return 0
 
 
@@ -1520,22 +1521,26 @@ def main() -> int:
         return 1
     except SSHDisconnectedError as error:
         print(f"\n{FAIL} SSH connection failed: {error}")
-        print(f"Progress saved in {settings['status_file']}. Restart to resume.")
+        db_name = resolve_status_db_path(settings).name
+        print(f"Progress saved in {db_name}. Restart to resume.")
         return 2
     except NetworkUnavailableError as error:
         print(f"\n{FAIL} Network unavailable: {error}")
-        print(f"Progress saved in {settings['status_file']}. Restart to resume.")
+        db_name = resolve_status_db_path(settings).name
+        print(f"Progress saved in {db_name}. Restart to resume.")
         return 3
     except TransferStalledError as error:
         print(f"\n{FAIL} Transfer stalled: {error}")
-        print(f"Progress saved in {settings['status_file']}. Restart to resume.")
+        db_name = resolve_status_db_path(settings).name
+        print(f"Progress saved in {db_name}. Restart to resume.")
         return 4
     except ServerHashScriptError as error:
         print(f"\n{FAIL} Server hash script error: {error}")
         print("Remote file hashes require calculate_hash.py on the server.")
         return 5
     except KeyboardInterrupt:
-        print(f"\nInterrupted. Progress saved in {settings['status_file']}.")
+        db_name = resolve_status_db_path(settings).name
+        print(f"\nInterrupted. Progress saved in {db_name}.")
         return 130
 
 
