@@ -10,6 +10,16 @@ from datetime import datetime
 from pathlib import Path
 
 
+MAX_USAGE_BYTES = 2 * 1024 * 1024
+
+
+def max_usage_bytes() -> int:
+    override = os.environ.get("CALCULATE_HASH_USAGE_MAX_BYTES", "").strip()
+    if override.isdigit():
+        return int(override)
+    return MAX_USAGE_BYTES
+
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -26,6 +36,28 @@ def usage_file_path() -> Path:
     if override:
         return Path(override)
     return Path(__file__).resolve().parent / "usage.json"
+
+
+def usage_archive_path(directory: Path, index: int) -> Path:
+    return directory / f"usage_{index:04d}.json"
+
+
+def next_usage_archive_path(directory: Path) -> Path:
+    max_index = -1
+    for path in directory.glob("usage_*.json"):
+        suffix = path.stem.removeprefix("usage_")
+        if suffix.isdigit():
+            max_index = max(max_index, int(suffix))
+    return usage_archive_path(directory, max_index + 1)
+
+
+def rotate_usage_if_needed(path: Path) -> None:
+    if not path.is_file():
+        return
+    if path.stat().st_size < max_usage_bytes():
+        return
+    archive_path = next_usage_archive_path(path.parent)
+    path.replace(archive_path)
 
 
 def current_user() -> str:
@@ -73,6 +105,7 @@ def record_usage(
     sha256: str,
     size: int,
 ) -> None:
+    rotate_usage_if_needed(path)
     files = load_usage(path)
     record = files.setdefault(
         absolute_file_path,
