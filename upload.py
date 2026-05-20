@@ -356,28 +356,53 @@ def ensure_network(settings: dict[str, Any]) -> None:
 class TransferTracker:
     """Tracks time since last byte moved; aborts if idle too long."""
 
+    _COUNTDOWN_PREFIX = "      stall timeout in "
+
     def __init__(self, timeout_seconds: int) -> None:
         self.timeout_seconds = timeout_seconds
         self._last_at = time.time()
         self._lock = threading.Lock()
         self._abort = threading.Event()
+        self._last_countdown = -1
 
     def note(self, nbytes: int) -> None:
         if nbytes > 0:
             with self._lock:
                 self._last_at = time.time()
+                self._last_countdown = -1
 
     def touch(self) -> None:
         with self._lock:
             self._last_at = time.time()
+            self._last_countdown = -1
 
     def idle_seconds(self) -> float:
         with self._lock:
             return time.time() - self._last_at
 
+    def remaining_seconds(self) -> int:
+        return max(0, int(self.timeout_seconds - self.idle_seconds()))
+
+    def clear_countdown(self) -> None:
+        width = len(self._COUNTDOWN_PREFIX) + len(str(self.timeout_seconds)) + 2
+        print("\r" + (" " * width) + "\r", end="", flush=True)
+        self._last_countdown = -1
+
+    def _show_countdown(self) -> None:
+        remaining = self.remaining_seconds()
+        if remaining == self._last_countdown:
+            return
+        self._last_countdown = remaining
+        print(
+            f"\r{self._COUNTDOWN_PREFIX}{remaining}s ",
+            end="",
+            flush=True,
+        )
+
     def check(self) -> None:
         idle = self.idle_seconds()
         if idle > self.timeout_seconds:
+            self.clear_countdown()
             raise TransferStalledError(
                 f"No data transferred for {int(idle)}s "
                 f"(limit: {self.timeout_seconds}s in upload_config.json)"
@@ -390,12 +415,17 @@ class TransferTracker:
         stop = threading.Event()
 
         def watcher() -> None:
-            while not stop.wait(5):
+            while not stop.wait(1):
+                if self._abort.is_set():
+                    return
+                self._show_countdown()
                 if self.idle_seconds() > self.timeout_seconds:
+                    self.clear_countdown()
                     if on_stall is not None:
                         on_stall()
                     self._abort.set()
                     return
+            self.clear_countdown()
 
         threading.Thread(target=watcher, daemon=True).start()
         return stop
@@ -787,6 +817,7 @@ def process_files(settings: dict[str, Any]) -> int:
     finally:
         if watchdog_stop is not None:
             watchdog_stop.set()
+        tracker.clear_countdown()
         close_ssh(client, sftp)
 
     print(
