@@ -9,5 +9,6 @@
   "status_file": "config.json",
   "network_check_interval_seconds": 10,
   "ssh_connect_timeout_seconds": 30,
-  "stall_timeout_seconds": 600
+  "stall_timeout_seconds": 600,
+  "loop_upload_interval": 300
 }
