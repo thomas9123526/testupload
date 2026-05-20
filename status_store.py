@@ -140,6 +140,7 @@ class StatusStore:
                 "auto_upload_retry_seconds",
                 "local_dir",
                 "server_calculate_hash_script",
+                "ignore",
             ):
                 if key in data and data[key] is not None:
                     self._conn.execute(

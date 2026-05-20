@@ -14,6 +14,7 @@ Resumable SFTP uploader for the material/ folder.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -180,9 +181,10 @@ def merge_config_json_settings(settings: dict[str, Any]) -> None:
                 settings["server_calculate_hash_script"] = str(
                     store.get_meta("server_calculate_hash_script")
                 ).strip()
+            if store.get_meta("ignore") is not None:
+                settings["ignore"] = store.get_meta("ignore")
         finally:
             store.close()
-        return
 
     json_path = status_json_path(settings)
     if not json_path.is_file():
@@ -197,6 +199,60 @@ def merge_config_json_settings(settings: dict[str, Any]) -> None:
         settings["server_calculate_hash_script"] = str(
             data["server_calculate_hash_script"]
         ).strip()
+    if data.get("ignore") is not None:
+        settings["ignore"] = data["ignore"]
+
+
+def normalize_ignore_patterns(raw: Any) -> list[str]:
+    """Parse ignore list from config.json / status meta."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return []
+    patterns: list[str] = []
+    for item in items:
+        text = str(item).strip().replace("\\", "/")
+        if text:
+            patterns.append(text)
+    return patterns
+
+
+def path_matches_ignore(rel_path: str, patterns: list[str]) -> bool:
+    """True if rel_path (posix) matches any ignore pattern (folder, file, or glob)."""
+    if not patterns:
+        return False
+    rel = rel_path.replace("\\", "/").strip("/")
+    if not rel:
+        return False
+    basename = rel.rsplit("/", 1)[-1]
+    segments = rel.split("/")
+
+    for pattern in patterns:
+        pat = pattern.strip("/")
+        if not pat:
+            continue
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(basename, pat):
+            return True
+        if "/" in pat:
+            if rel == pat or rel.startswith(pat + "/"):
+                return True
+        elif pat in segments:
+            return True
+    return False
+
+
+def load_ignore_patterns(
+    settings: dict[str, Any],
+    status: StatusStore,
+) -> list[str]:
+    """Load ignore list (config.json overrides sqlite meta via merge_config_json_settings)."""
+    if settings.get("ignore") is not None:
+        return normalize_ignore_patterns(settings["ignore"])
+    return normalize_ignore_patterns(status.get_meta("ignore"))
 
 
 def local_root_path(settings: dict[str, Any]) -> Path:
@@ -317,6 +373,7 @@ class UploadJob:
 class PipelineProgress:
     lock: threading.Lock = field(default_factory=threading.Lock)
     scan_discovered: int = 0
+    scan_ignored: int = 0
     scan_current: str = ""
     scan_done: bool = False
     hash_done: int = 0
@@ -351,6 +408,7 @@ class PipelineProgress:
     def format_dashboard(self) -> str:
         with self.lock:
             s_found = self.scan_discovered
+            s_ignored = self.scan_ignored
             s_cur = self.scan_current
             s_done = self.scan_done
             h_done = self.hash_done
@@ -372,7 +430,7 @@ class PipelineProgress:
         lines = [
             "┌─ Pipeline " + "─" * 52 + "┐",
             f"│ Scan  {self._bar(s_found, 0 if not s_done else s_found)} "
-            f"{s_found:7} found  {self._clip(s_cur)} │",
+            f"{s_found:7} found skip:{s_ignored:<5} {self._clip(s_cur)} │",
             f"│ Hash  {self._bar(h_done, hash_ref)} {h_done:7}/{hash_ref:<7} "
             f"c:{h_cached} n:{h_computed}  {self._clip(h_cur)} │",
             f"│ Cache {self._bar(c_saved, max(c_saved + c_pending, 1))} "
@@ -393,6 +451,7 @@ class UploadPipeline:
     cache: dict[str, Any]
     progress: PipelineProgress
     local_root: Path
+    ignore_patterns: list[str] = field(default_factory=list)
     scan_queue: Queue[Any] = field(
         default_factory=lambda: Queue(maxsize=_SCAN_QUEUE_MAXSIZE)
     )
@@ -432,7 +491,9 @@ def _truncate_display_path(rel_path: str, max_parts: int = 2) -> str:
 def pipeline_scan_worker(pipeline: UploadPipeline) -> None:
     """Thread 1: stream local files into bounded scan_queue (no full-tree list in RAM)."""
     try:
-        for rel_path, path in iter_local_files(pipeline.local_root):
+        for rel_path, path in iter_local_files(
+            pipeline.local_root, pipeline.ignore_patterns
+        ):
             pipeline.check_error()
             with pipeline.known_paths_lock:
                 pipeline.known_paths.add(rel_path)
@@ -714,13 +775,17 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def iter_local_files(local_root: Path):
+def iter_local_files(
+    local_root: Path,
+    ignore_patterns: list[str] | None = None,
+):
     """Yield (rel_path, path) using os.scandir — no sort, no full list in memory."""
     local_root = local_root.resolve()
     if not local_root.is_dir():
         print(f"Local folder not found: {local_root}")
         sys.exit(1)
 
+    patterns = ignore_patterns or []
     stack: list[Path] = [local_root]
     while stack:
         current = stack.pop()
@@ -729,10 +794,16 @@ def iter_local_files(local_root: Path):
                 for entry in entries:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
+                            child = Path(entry.path)
+                            rel_dir = child.relative_to(local_root).as_posix()
+                            if path_matches_ignore(rel_dir, patterns):
+                                continue
+                            stack.append(child)
                         elif entry.is_file(follow_symlinks=False):
                             path = Path(entry.path)
                             rel = path.relative_to(local_root).as_posix()
+                            if path_matches_ignore(rel, patterns):
+                                continue
                             yield rel, path
                     except OSError:
                         continue
@@ -740,9 +811,12 @@ def iter_local_files(local_root: Path):
             print(f"  Warning: cannot read directory {current}: {error}", file=sys.stderr)
 
 
-def scan_local_files(local_root: Path) -> list[tuple[str, Path]]:
+def scan_local_files(
+    local_root: Path,
+    ignore_patterns: list[str] | None = None,
+) -> list[tuple[str, Path]]:
     """Collect all files (legacy / small trees). Prefer iter_local_files for large dirs."""
-    return list(iter_local_files(local_root))
+    return list(iter_local_files(local_root, ignore_patterns))
 
 
 def scan_local_directories(local_root: Path) -> list[str]:
@@ -1347,8 +1421,17 @@ def _process_files(
     status: StatusStore,
 ) -> int:
     cache = load_scan_cache(settings)
+    ignore_patterns = load_ignore_patterns(settings, status)
+    if ignore_patterns:
+        status.set_meta("ignore", ignore_patterns)
 
     print(f"Local upload folder: {local_root}")
+    if ignore_patterns:
+        print(f"Ignore patterns ({len(ignore_patterns)}):")
+        for pattern in ignore_patterns[:12]:
+            print(f"  - {pattern}")
+        if len(ignore_patterns) > 12:
+            print(f"  ... and {len(ignore_patterns) - 12} more")
     print(
         "Streaming pipeline (scan | hash | cache | upload). "
         f"Queues: scan={_SCAN_QUEUE_MAXSIZE}, upload={_READY_QUEUE_MAXSIZE}.\n"
@@ -1359,6 +1442,7 @@ def _process_files(
         status=status,
         cache=cache,
         local_root=local_root,
+        ignore_patterns=ignore_patterns,
         progress=PipelineProgress(),
     )
 
@@ -1450,6 +1534,8 @@ def _process_files(
                 "server_calculate_hash_script",
                 settings["server_calculate_hash_script"],
             )
+        if ignore_patterns:
+            status.set_meta("ignore", ignore_patterns)
 
         open_session()
         assert sftp is not None and exec_client is not None

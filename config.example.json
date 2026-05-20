@@ -1,7 +1,14 @@
 {
-  "_note": "Legacy meta-only file. upload.py uses config.sqlite for per-file status (fast at scale). Existing config.json is migrated automatically on first run.",
+  "_note": "Meta for upload.py. Per-file progress lives in config.sqlite. config.json is migrated on first run.",
   "version": 1,
   "local_dir": "C:/Users/YOUR_NAME/path/to/upload",
   "auto_upload_retry_seconds": 300,
-  "server_calculate_hash_script": "/home/YOUR_USER/calculate_hash.py"
+  "server_calculate_hash_script": "/home/YOUR_USER/calculate_hash.py",
+  "ignore": [
+    ".git",
+    ".gradle",
+    "build",
+    "*.tmp",
+    "platforms/android-33"
+  ]
 }
