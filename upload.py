@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -215,7 +215,7 @@ def normalize_ignore_patterns(raw: Any) -> list[str]:
         return []
     patterns: list[str] = []
     for item in items:
-        text = str(item).strip().replace("\\", "/")
+        text = str(item).strip().replace("\\", "/").strip("/")
         if text:
             patterns.append(text)
     return patterns
@@ -387,9 +387,10 @@ class PipelineProgress:
     upload_queued: int = 0
     upload_done: int = 0
     upload_current: str = ""
+    upload_phase: str = ""
+    upload_file_line: str = ""
     uploaded_count: int = 0
     skipped_count: int = 0
-    upload_busy: bool = False
     failed: bool = False
 
     def _bar(self, done: int, total: int, width: int = 16) -> str:
@@ -424,11 +425,22 @@ class PipelineProgress:
             u_ok = self.uploaded_count
             u_skip = self.skipped_count
             u_cur = self.upload_current
-            upload_busy = self.upload_busy
+            u_phase = self.upload_phase
+            u_file = self.upload_file_line
 
         hash_ref = s_found if not h_flag else max(h_done, 1)
+        if not s_done:
+            upload_hint = "scanning local tree"
+        elif not h_flag:
+            upload_hint = "hashing before upload"
+        elif u_queued == 0:
+            upload_hint = "no files need upload"
+        elif u_done < u_queued:
+            upload_hint = u_phase or "active"
+        else:
+            upload_hint = "done"
         lines = [
-            "┌─ Pipeline " + "─" * 52 + "┐",
+            "┌─ Pipeline " + "─" * 56 + "┐",
             f"│ Scan  {self._bar(s_found, 0 if not s_done else s_found)} "
             f"{s_found:7} found skip:{s_ignored:<5} {self._clip(s_cur)} │",
             f"│ Hash  {self._bar(h_done, hash_ref)} {h_done:7}/{hash_ref:<7} "
@@ -437,10 +449,11 @@ class PipelineProgress:
             f"{c_saved:7} saved pend:{c_pending:<4} {self._clip(c_cur)} │",
             f"│ Upload{self._bar(u_done, max(u_queued, 1))} {u_done:7}/{u_queued:<7} "
             f"ok:{u_ok} sk:{u_skip}  {self._clip(u_cur)} │",
+            f"│ Phase {upload_hint:<52} │",
         ]
-        if upload_busy:
-            lines.append("│" + " active transfer (file progress below) ".center(54) + "│")
-        lines.append("└" + "─" * 54 + "┘")
+        if u_file:
+            lines.append(f"│ File  {self._clip(u_file, 52)} │")
+        lines.append("└" + "─" * 56 + "┘")
         return "\n".join(lines)
 
 
@@ -515,9 +528,7 @@ def pipeline_scan_worker(pipeline: UploadPipeline) -> None:
 def pipeline_status_loop(pipeline: UploadPipeline) -> None:
     """Refresh the pipeline dashboard until stop_display is set."""
     last_line_count = 0
-    while not pipeline.stop_display.wait(0.4):
-        if pipeline.progress.upload_busy:
-            continue
+    while not pipeline.stop_display.wait(0.35):
         block = pipeline.progress.format_dashboard()
         line_count = block.count("\n") + 1
         with pipeline.print_lock:
@@ -659,7 +670,22 @@ def pipeline_upload_worker(
 
     while True:
         pipeline.check_error()
-        item = pipeline.ready_queue.get()
+        try:
+            item = pipeline.ready_queue.get(timeout=1.0)
+        except Empty:
+            with pipeline.progress.lock:
+                if not pipeline.scan_complete.is_set():
+                    pipeline.progress.upload_phase = "waiting (scanning local files)"
+                    pipeline.progress.upload_current = "blocked: scan in progress"
+                elif not pipeline.hash_complete.is_set():
+                    pipeline.progress.upload_phase = "waiting (hashing files)"
+                    pipeline.progress.upload_current = "blocked: hash queue"
+                else:
+                    pipeline.progress.upload_phase = "waiting (queue empty)"
+                    pipeline.progress.upload_current = "idle"
+                pipeline.progress.upload_file_line = ""
+            continue
+
         if item is _PIPELINE_SENTINEL:
             break
 
@@ -672,6 +698,8 @@ def pipeline_upload_worker(
 
         with pipeline.progress.lock:
             pipeline.progress.upload_current = _truncate_display_path(rel_path)
+            pipeline.progress.upload_phase = "comparing with server"
+            pipeline.progress.upload_file_line = ""
 
         remote_path = resolve_remote_path(server_path, rel_path)
         tracker.check()
@@ -701,19 +729,13 @@ def pipeline_upload_worker(
                 with pipeline.progress.lock:
                     pipeline.progress.skipped_count += 1
                     pipeline.progress.upload_done += 1
+                    pipeline.progress.upload_phase = "skipped (identical)"
                 with pipeline.print_lock:
-                    pipeline.progress.upload_busy = True
-                    pipeline.stop_display.set()
-                    time.sleep(0.05)
                     print(f"{prefix} ... {SKIP} skipped (identical on server)")
-                    pipeline.progress.upload_busy = False
-                    pipeline.stop_display.clear()
                 continue
 
-            with pipeline.print_lock:
-                pipeline.progress.upload_busy = True
-                pipeline.stop_display.set()
-                time.sleep(0.05)
+            with pipeline.progress.lock:
+                pipeline.progress.upload_phase = "uploading"
 
             upload_with_retry(
                 pipeline.settings,
@@ -723,7 +745,12 @@ def pipeline_upload_worker(
                 job.info["size"],
                 tracker,
                 prefix,
+                pipeline.progress,
             )
+
+            with pipeline.progress.lock:
+                pipeline.progress.upload_phase = "verifying"
+                pipeline.progress.upload_file_line = ""
 
             tracker.set_activity("Verifying upload", prefix)
             verify = remote_file_info(
@@ -751,17 +778,25 @@ def pipeline_upload_worker(
             with pipeline.progress.lock:
                 pipeline.progress.uploaded_count += 1
                 pipeline.progress.upload_done += 1
-            print(f"{prefix} ... {CHECK} success")
+                pipeline.progress.upload_phase = "done"
+                pipeline.progress.upload_file_line = ""
+            with pipeline.print_lock:
+                print(f"{prefix} ... {CHECK} success")
         except BaseException as exc:
             pipeline.set_error(exc)
             raise
         finally:
-            with pipeline.print_lock:
-                pipeline.progress.upload_busy = False
-                pipeline.stop_display.clear()
+            with pipeline.progress.lock:
+                if pipeline.progress.upload_phase in (
+                    "uploading",
+                    "comparing with server",
+                    "verifying",
+                ):
+                    pipeline.progress.upload_file_line = ""
 
     with pipeline.progress.lock:
         pipeline.progress.upload_current = "done"
+        pipeline.progress.upload_phase = "finished"
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -1340,6 +1375,7 @@ def upload_with_retry(
     total_size: int,
     tracker: TransferTracker,
     label: str,
+    progress: PipelineProgress | None = None,
 ) -> None:
     if tracker is not None:
         tracker.set_activity("Preparing remote path", label)
@@ -1373,7 +1409,11 @@ def upload_with_retry(
         last_report = now
         last_done = done
         line = format_progress_line(label, done, total, speed)
-        print(f"\r{line}", end="", flush=True)
+        if progress is not None:
+            with progress.lock:
+                progress.upload_file_line = line
+        else:
+            print(f"\r{line}", end="", flush=True)
 
     def do_put() -> None:
         try:
@@ -1402,8 +1442,13 @@ def upload_with_retry(
 
     elapsed = max(time.time() - start_time, 0.001)
     avg_speed = total_size / elapsed if total_size else 0
-    print(f"\r{format_progress_line(label, total_size, total_size, avg_speed)} (avg)")
-    print()
+    final_line = f"{format_progress_line(label, total_size, total_size, avg_speed)} (avg)"
+    if progress is not None:
+        with progress.lock:
+            progress.upload_file_line = final_line
+    else:
+        print(f"\r{final_line}")
+        print()
 
 
 def process_files(settings: dict[str, Any]) -> int:
@@ -1480,18 +1525,6 @@ def _process_files(
     cache_thread.start()
     display_thread.start()
 
-    scan_thread.join()
-    pipeline.check_error()
-    with pipeline.progress.lock:
-        discovered = pipeline.progress.scan_discovered
-    if discovered == 0:
-        hash_thread.join()
-        cache_thread.join()
-        pipeline.stop_display.set()
-        display_thread.join(timeout=2)
-        print(f"No files found in {local_root}")
-        return 0
-
     server_path = settings["server_upload_path"]
     remote_base = resolve_remote_path(server_path, "")
     client: paramiko.SSHClient | None = None
@@ -1553,12 +1586,17 @@ def _process_files(
         )
         upload_thread.start()
 
+        scan_thread.join()
         hash_thread.join()
         upload_thread.join()
         cache_thread.join()
         pipeline.check_error()
 
         with pipeline.progress.lock:
+            discovered = pipeline.progress.scan_discovered
+            if discovered == 0:
+                print(f"No files found in {local_root}")
+                return 0
             if pipeline.progress.upload_queued == 0:
                 print("Nothing to upload.")
     except BaseException as exc:
