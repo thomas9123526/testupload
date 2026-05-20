@@ -137,7 +137,7 @@ def load_settings() -> dict[str, Any]:
     if not str(settings.get("local_dir", "")).strip():
         print(
             f"Missing local_dir: set it in {settings['status_file']} or {SETTINGS_FILE.name} "
-            f"(folder to upload, relative to project or absolute path)."
+            f"(absolute path, or relative to project; on Windows use C:/path or C:\\\\path in JSON)."
         )
         sys.exit(1)
     script = str(settings.get("server_calculate_hash_script", "")).strip().replace("\\", "/")
@@ -175,12 +175,12 @@ def merge_config_json_settings(settings: dict[str, Any]) -> None:
 
 
 def local_root_path(settings: dict[str, Any]) -> Path:
-    """Resolve local upload folder from local_dir (relative to project or absolute)."""
+    """Resolve local_dir: absolute path as-is, relative path under project root."""
     raw = str(settings["local_dir"]).strip()
     path = Path(raw)
-    if not path.is_absolute():
-        path = SCRIPT_DIR / path
-    return path.resolve()
+    if path.is_absolute():
+        return path.resolve()
+    return (SCRIPT_DIR / path).resolve()
 
 
 def status_path(settings: dict[str, Any]) -> Path:
