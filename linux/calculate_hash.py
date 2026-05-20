@@ -64,7 +64,15 @@ def save_usage(path: Path, files: dict[str, dict]) -> None:
     tmp_path.replace(path)
 
 
-def record_usage(path: Path, absolute_file_path: str, user: str, when: str) -> None:
+def record_usage(
+    path: Path,
+    absolute_file_path: str,
+    user: str,
+    when: str,
+    *,
+    sha256: str,
+    size: int,
+) -> None:
     files = load_usage(path)
     record = files.setdefault(
         absolute_file_path,
@@ -73,7 +81,9 @@ def record_usage(path: Path, absolute_file_path: str, user: str, when: str) -> N
     record["execution_count"] = int(record.get("execution_count", 0)) + 1
     executions = record.setdefault("executions", [])
     if isinstance(executions, list):
-        executions.append({"user": user, "time": when})
+        executions.append(
+            {"user": user, "time": when, "sha256": sha256, "size": size}
+        )
     save_usage(path, files)
 
 
@@ -87,15 +97,23 @@ def main() -> int:
         print(json.dumps({"error": "not_found", "path": str(target)}))
         return 1
 
+    stat = target.stat()
+    digest = sha256_file(target)
     user = current_user()
     timestamp = datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-    record_usage(usage_file_path(), str(target), user, timestamp)
+    record_usage(
+        usage_file_path(),
+        str(target),
+        user,
+        timestamp,
+        sha256=digest,
+        size=stat.st_size,
+    )
 
-    stat = target.stat()
     result = {
         "path": str(target),
         "size": stat.st_size,
-        "sha256": sha256_file(target),
+        "sha256": digest,
     }
     print(json.dumps(result))
     return 0
