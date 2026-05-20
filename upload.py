@@ -85,14 +85,25 @@ def load_settings() -> dict[str, Any]:
     with SETTINGS_FILE.open("r", encoding="utf-8") as handle:
         settings = json.load(handle)
 
-    required = ("host", "port", "username", "password", "local_dir")
+    required = ("host", "port", "username", "local_dir")
     missing = [key for key in required if not settings.get(key)]
     upload_path = (settings.get("server_upload_path") or settings.get("remote_dir") or "").strip()
     if not upload_path:
         missing.append("server_upload_path")
+    password = str(settings.get("password", "")).strip()
+    key_path = str(settings.get("private_key_path", "")).strip()
+    if not password and not key_path:
+        missing.append("password or private_key_path")
     if missing:
         print(f"Missing settings in {SETTINGS_FILE.name}: {', '.join(missing)}")
         sys.exit(1)
+
+    settings["password"] = password
+    if key_path:
+        key_file = Path(key_path)
+        if not key_file.is_absolute():
+            key_file = SCRIPT_DIR / key_file
+        settings["private_key_path"] = str(key_file)
 
     settings["server_upload_path"] = upload_path.replace("\\", "/").rstrip("/")
     if not settings["server_upload_path"].startswith("/"):
@@ -267,10 +278,32 @@ def close_ssh(
             pass
 
 
+def ssh_connect_kwargs(settings: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "hostname": settings["host"],
+        "port": int(settings["port"]),
+        "username": settings["username"],
+        "timeout": int(settings["ssh_connect_timeout_seconds"]),
+        "banner_timeout": int(settings["ssh_connect_timeout_seconds"]),
+        "auth_timeout": int(settings["ssh_connect_timeout_seconds"]),
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    key_path = settings.get("private_key_path")
+    if key_path:
+        kwargs["key_filename"] = key_path
+        if settings.get("password"):
+            kwargs["password"] = settings["password"]
+    else:
+        kwargs["password"] = settings["password"]
+    return kwargs
+
+
 def connect_ssh(settings: dict[str, Any]) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
     """Connect with retries; SFTP-only (no shell) for shared-host compatibility."""
     max_attempts = 3
     last_error: BaseException | None = None
+    connect_kwargs = ssh_connect_kwargs(settings)
 
     for attempt in range(1, max_attempts + 1):
         client = paramiko.SSHClient()
@@ -278,17 +311,7 @@ def connect_ssh(settings: dict[str, Any]) -> tuple[paramiko.SSHClient, paramiko.
         try:
             if attempt > 1:
                 print(f"  Retry {attempt}/{max_attempts} ...")
-            client.connect(
-                hostname=settings["host"],
-                port=int(settings["port"]),
-                username=settings["username"],
-                password=settings["password"],
-                timeout=int(settings["ssh_connect_timeout_seconds"]),
-                banner_timeout=int(settings["ssh_connect_timeout_seconds"]),
-                auth_timeout=int(settings["ssh_connect_timeout_seconds"]),
-                look_for_keys=False,
-                allow_agent=False,
-            )
+            client.connect(**connect_kwargs)
             transport = client.get_transport()
             if transport is not None:
                 transport.set_keepalive(30)
@@ -569,6 +592,15 @@ def main() -> int:
     settings = load_settings()
     try:
         return process_files(settings)
+    except AuthenticationException:
+        auth = "private key" if settings.get("private_key_path") else "password"
+        print(
+            f"\n{FAIL} SSH authentication failed for "
+            f"{settings['username']}@{settings['host']}:{settings['port']} ({auth})."
+        )
+        print(f"Check {auth} in {SETTINGS_FILE.name}.")
+        print("Confirm SFTP/SSH login works in FileZilla or: ssh user@host")
+        return 1
     except SSHDisconnectedError as error:
         print(f"\n{FAIL} SSH connection failed: {error}")
         print("Check host, credentials, and server_upload_path in upload_config.json.")
