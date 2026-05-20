@@ -452,6 +452,12 @@ def format_bytes(num: int) -> str:
     return f"{num} B"
 
 
+def format_speed(bytes_per_sec: float) -> str:
+    if bytes_per_sec <= 0:
+        return "0 B/s"
+    return f"{format_bytes(int(bytes_per_sec))}/s"
+
+
 def upload_with_retry(
     settings: dict[str, Any],
     sftp: paramiko.SFTPClient,
@@ -459,28 +465,38 @@ def upload_with_retry(
     remote_path: str,
     total_size: int,
 ) -> None:
-    transferred = 0
-    last_report = 0.0
-
-    def callback(done: int, total: int) -> None:
-        nonlocal transferred, last_report
-        transferred = done
-        now = time.time()
-        if now - last_report < 0.2 and done != total:
-            return
-        last_report = now
-        percent = (done / total * 100) if total else 100.0
-        print(
-            f"\r      progress: {format_bytes(done)} / {format_bytes(total)} ({percent:5.1f}%)",
-            end="",
-            flush=True,
-        )
-
     while True:
         try:
             ensure_remote_dir(sftp, remote_path)
+            start_time = time.time()
+            last_report = start_time
+            last_done = 0
+
+            def callback(done: int, total: int) -> None:
+                nonlocal last_report, last_done
+                now = time.time()
+                if now - last_report < 0.2 and done != total:
+                    return
+                elapsed = max(now - start_time, 0.001)
+                interval = max(now - last_report, 0.001)
+                avg_speed = done / elapsed
+                instant_speed = (done - last_done) / interval
+                speed = instant_speed if last_done > 0 else avg_speed
+                last_report = now
+                last_done = done
+                percent = (done / total * 100) if total else 100.0
+                print(
+                    f"\r      progress: {format_bytes(done)} / {format_bytes(total)} "
+                    f"({percent:5.1f}%) @ {format_speed(speed)}",
+                    end="",
+                    flush=True,
+                )
+
             sftp.put(str(local_path), remote_path, callback=callback, confirm=True)
-            print()
+            elapsed = max(time.time() - start_time, 0.001)
+            avg_speed = total_size / elapsed
+            print(f"\r      progress: {format_bytes(total_size)} / {format_bytes(total_size)} "
+                  f"(100.0%) @ {format_speed(avg_speed)} (avg)")
             return
         except Exception as error:
             if is_ssh_disconnect(error):
