@@ -5,7 +5,7 @@ Resumable SFTP uploader for the material/ folder.
 - Uploads all files under local_dir (upload_config.json or config.json)
 - Mirrors the local folder tree on the server (same subfolders)
 - Tracks per-file upload status in config.json (including uploaded_success filename list)
-- Parallel pipeline: hash thread, cache writer thread, upload thread (mutex + queues)
+- Streaming pipeline: scan, hash, cache, upload threads (bounded queues, lazy remote mkdir)
 - Caches local SHA-256 scans in cache.json incrementally while hashing
 - Exits on network/server failure or transfer stall (progress saved in config.json)
 - Skips remote files that match local content (SHA-256 + size)
@@ -320,6 +320,10 @@ def local_file_info(
 
 
 _PIPELINE_SENTINEL = object()
+_SCAN_QUEUE_MAXSIZE = 8192
+_READY_QUEUE_MAXSIZE = 2048
+
+
 @dataclass
 class UploadJob:
     rel_path: str
@@ -329,12 +333,15 @@ class UploadJob:
 
 @dataclass
 class PipelineProgress:
-    hash_total: int
     lock: threading.Lock = field(default_factory=threading.Lock)
+    scan_discovered: int = 0
+    scan_current: str = ""
+    scan_done: bool = False
     hash_done: int = 0
     hash_cached: int = 0
     hash_computed: int = 0
     hash_current: str = ""
+    hash_done_flag: bool = False
     cache_saved: int = 0
     cache_pending: int = 0
     cache_current: str = ""
@@ -344,16 +351,16 @@ class PipelineProgress:
     uploaded_count: int = 0
     skipped_count: int = 0
     upload_busy: bool = False
-    finished: bool = False
     failed: bool = False
 
-    def _bar(self, done: int, total: int, width: int = 20) -> str:
+    def _bar(self, done: int, total: int, width: int = 16) -> str:
         if total <= 0:
-            return "[" + " " * width + "]"
+            pulse = int(done) % width
+            return "[" + ("~" * pulse + " " * (width - pulse)) + "]"
         filled = min(width, int(width * done / total))
         return "[" + "#" * filled + "-" * (width - filled) + "]"
 
-    def _clip(self, text: str, max_len: int = 42) -> str:
+    def _clip(self, text: str, max_len: int = 36) -> str:
         text = text or "—"
         if len(text) <= max_len:
             return text.ljust(max_len)
@@ -361,28 +368,39 @@ class PipelineProgress:
 
     def format_dashboard(self) -> str:
         with self.lock:
-            h_done, h_tot = self.hash_done, self.hash_total
-            h_cached, h_computed = self.hash_cached, self.hash_computed
-            c_saved, c_pending = self.cache_saved, self.cache_pending
-            u_done, u_queued = self.upload_done, self.upload_queued
-            u_ok, u_skip = self.uploaded_count, self.skipped_count
-            hash_cur = self.hash_current
-            cache_cur = self.cache_current
-            upload_cur = self.upload_current
+            s_found = self.scan_discovered
+            s_cur = self.scan_current
+            s_done = self.scan_done
+            h_done = self.hash_done
+            h_cached = self.hash_cached
+            h_computed = self.hash_computed
+            h_cur = self.hash_current
+            h_flag = self.hash_done_flag
+            c_saved = self.cache_saved
+            c_pending = self.cache_pending
+            c_cur = self.cache_current
+            u_done = self.upload_done
+            u_queued = self.upload_queued
+            u_ok = self.uploaded_count
+            u_skip = self.skipped_count
+            u_cur = self.upload_current
             upload_busy = self.upload_busy
 
+        hash_ref = s_found if not h_flag else max(h_done, 1)
         lines = [
-            "┌─ Pipeline " + "─" * 56 + "┐",
-            f"│ Hash  {self._bar(h_done, h_tot)} {h_done:5}/{h_tot:<5} "
-            f"cache:{h_cached} new:{h_computed}  {self._clip(hash_cur)} │",
+            "┌─ Pipeline " + "─" * 52 + "┐",
+            f"│ Scan  {self._bar(s_found, 0 if not s_done else s_found)} "
+            f"{s_found:7} found  {self._clip(s_cur)} │",
+            f"│ Hash  {self._bar(h_done, hash_ref)} {h_done:7}/{hash_ref:<7} "
+            f"c:{h_cached} n:{h_computed}  {self._clip(h_cur)} │",
             f"│ Cache {self._bar(c_saved, max(c_saved + c_pending, 1))} "
-            f"{c_saved:5} saved  pending:{c_pending:4}  {self._clip(cache_cur)} │",
-            f"│ Upload{self._bar(u_done, max(u_queued, 1))} {u_done:5}/{u_queued:<5} "
-            f"ok:{u_ok} skip:{u_skip}  {self._clip(upload_cur)} │",
+            f"{c_saved:7} saved pend:{c_pending:<4} {self._clip(c_cur)} │",
+            f"│ Upload{self._bar(u_done, max(u_queued, 1))} {u_done:7}/{u_queued:<7} "
+            f"ok:{u_ok} sk:{u_skip}  {self._clip(u_cur)} │",
         ]
         if upload_busy:
-            lines.append("│" + " active transfer (file progress below) ".center(58) + "│")
-        lines.append("└" + "─" * 58 + "┘")
+            lines.append("│" + " active transfer (file progress below) ".center(54) + "│")
+        lines.append("└" + "─" * 54 + "┘")
         return "\n".join(lines)
 
 
@@ -391,14 +409,22 @@ class UploadPipeline:
     settings: dict[str, Any]
     status: dict[str, Any]
     cache: dict[str, Any]
-    known_paths: set[str]
     progress: PipelineProgress
-    ready_queue: Queue[Any] = field(default_factory=Queue)
+    local_root: Path
+    scan_queue: Queue[Any] = field(
+        default_factory=lambda: Queue(maxsize=_SCAN_QUEUE_MAXSIZE)
+    )
+    ready_queue: Queue[Any] = field(
+        default_factory=lambda: Queue(maxsize=_READY_QUEUE_MAXSIZE)
+    )
+    known_paths: set[str] = field(default_factory=set)
+    known_paths_lock: threading.Lock = field(default_factory=threading.Lock)
     cache_lock: threading.Lock = field(default_factory=threading.Lock)
     status_lock: threading.Lock = field(default_factory=threading.Lock)
     print_lock: threading.Lock = field(default_factory=threading.Lock)
     pending_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     cache_dirty: threading.Event = field(default_factory=threading.Event)
+    scan_complete: threading.Event = field(default_factory=threading.Event)
     hash_complete: threading.Event = field(default_factory=threading.Event)
     stop_display: threading.Event = field(default_factory=threading.Event)
     error: list[BaseException] = field(default_factory=list)
@@ -421,8 +447,30 @@ def _truncate_display_path(rel_path: str, max_parts: int = 2) -> str:
     return ".../" + "/".join(parts[-max_parts:])
 
 
+def pipeline_scan_worker(pipeline: UploadPipeline) -> None:
+    """Thread 1: stream local files into bounded scan_queue (no full-tree list in RAM)."""
+    try:
+        for rel_path, path in iter_local_files(pipeline.local_root):
+            pipeline.check_error()
+            with pipeline.known_paths_lock:
+                pipeline.known_paths.add(rel_path)
+            with pipeline.progress.lock:
+                pipeline.progress.scan_discovered += 1
+                pipeline.progress.scan_current = _truncate_display_path(rel_path)
+            pipeline.scan_queue.put((rel_path, path))
+    except BaseException as exc:
+        pipeline.set_error(exc)
+        raise
+    finally:
+        pipeline.scan_queue.put(_PIPELINE_SENTINEL)
+        pipeline.scan_complete.set()
+        with pipeline.progress.lock:
+            pipeline.progress.scan_current = "done"
+            pipeline.progress.scan_done = True
+
+
 def pipeline_status_loop(pipeline: UploadPipeline) -> None:
-    """Refresh the 3-line pipeline dashboard until stop_display is set."""
+    """Refresh the pipeline dashboard until stop_display is set."""
     last_line_count = 0
     while not pipeline.stop_display.wait(0.4):
         if pipeline.progress.upload_busy:
@@ -441,16 +489,17 @@ def pipeline_status_loop(pipeline: UploadPipeline) -> None:
             sys.stdout.flush()
 
 
-def pipeline_hash_worker(
-    pipeline: UploadPipeline,
-    all_files: list[tuple[str, Path]],
-) -> None:
-    """Thread 1: compute local hashes and enqueue files ready for upload."""
-    for rel_path, path in all_files:
+def pipeline_hash_worker(pipeline: UploadPipeline) -> None:
+    """Thread 2: hash files from scan_queue and enqueue uploads when ready."""
+    while True:
         pipeline.check_error()
-        short = _truncate_display_path(rel_path)
+        item = pipeline.scan_queue.get()
+        if item is _PIPELINE_SENTINEL:
+            break
+
+        rel_path, path = item
         with pipeline.progress.lock:
-            pipeline.progress.hash_current = short
+            pipeline.progress.hash_current = _truncate_display_path(rel_path)
 
         stat = path.stat()
         size = stat.st_size
@@ -505,11 +554,11 @@ def pipeline_hash_worker(
     pipeline.cache_dirty.set()
     with pipeline.progress.lock:
         pipeline.progress.hash_current = "done"
-        pipeline.progress.finished = True
+        pipeline.progress.hash_done_flag = True
 
 
 def pipeline_cache_worker(pipeline: UploadPipeline) -> None:
-    """Thread 2: flush new hashes to cache.json while hashing runs."""
+    """Thread 3: flush new hashes to cache.json while scan/hash run."""
     while True:
         pipeline.cache_dirty.wait(timeout=0.5)
         pipeline.check_error()
@@ -537,12 +586,15 @@ def pipeline_cache_worker(pipeline: UploadPipeline) -> None:
                 pipeline.progress.cache_saved += len(batch)
                 pipeline.progress.cache_current = "idle"
 
-        if pipeline.hash_complete.is_set():
+        if pipeline.scan_complete.is_set() and pipeline.hash_complete.is_set():
             with pipeline.cache_lock:
                 if not pipeline.pending_cache:
                     break
 
-    prune_scan_cache(pipeline.cache, pipeline.known_paths)
+    with pipeline.known_paths_lock:
+        paths_snapshot = set(pipeline.known_paths)
+    if paths_snapshot:
+        prune_scan_cache(pipeline.cache, paths_snapshot)
     save_scan_cache(pipeline.settings, pipeline.cache)
     with pipeline.progress.lock:
         pipeline.progress.cache_current = "done"
@@ -555,9 +607,12 @@ def pipeline_upload_worker(
     exec_client: paramiko.SSHClient,
     tracker: TransferTracker,
 ) -> None:
-    """Thread 3: upload files as soon as their hash is ready."""
+    """Thread 4: upload files as soon as their hash is ready (lazy remote mkdir)."""
     hash_script = pipeline.settings["server_calculate_hash_script"]
     server_path = pipeline.settings["server_upload_path"]
+    remote_base = resolve_remote_path(server_path, "")
+    tracker.set_activity("Ensuring remote base", remote_base)
+    ensure_remote_directory(sftp, remote_base)
 
     while True:
         pipeline.check_error()
@@ -679,17 +734,35 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def scan_local_files(local_root: Path) -> list[tuple[str, Path]]:
-    if not local_root.exists():
+def iter_local_files(local_root: Path):
+    """Yield (rel_path, path) using os.scandir — no sort, no full list in memory."""
+    local_root = local_root.resolve()
+    if not local_root.is_dir():
         print(f"Local folder not found: {local_root}")
         sys.exit(1)
 
-    files: list[tuple[str, Path]] = []
-    for path in sorted(local_root.rglob("*")):
-        if path.is_file():
-            rel = path.relative_to(local_root).as_posix()
-            files.append((rel, path))
-    return files
+    stack: list[Path] = [local_root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            path = Path(entry.path)
+                            rel = path.relative_to(local_root).as_posix()
+                            yield rel, path
+                    except OSError:
+                        continue
+        except OSError as error:
+            print(f"  Warning: cannot read directory {current}: {error}", file=sys.stderr)
+
+
+def scan_local_files(local_root: Path) -> list[tuple[str, Path]]:
+    """Collect all files (legacy / small trees). Prefer iter_local_files for large dirs."""
+    return list(iter_local_files(local_root))
 
 
 def scan_local_directories(local_root: Path) -> list[str]:
@@ -1282,28 +1355,30 @@ def process_files(settings: dict[str, Any]) -> int:
     local_root = local_root_path(settings)
     status = load_status(settings)
     cache = load_scan_cache(settings)
-    all_files = scan_local_files(local_root)
 
-    if not all_files:
-        print(f"No files found in {local_root}")
-        return 0
-
-    total = len(all_files)
-    known_paths = {rel_path for rel_path, _ in all_files}
     print(f"Local upload folder: {local_root}")
-    print(f"Found {total} file(s). Starting parallel pipeline (hash | cache | upload).\n")
+    print(
+        "Streaming pipeline (scan | hash | cache | upload). "
+        f"Queues: scan={_SCAN_QUEUE_MAXSIZE}, upload={_READY_QUEUE_MAXSIZE}.\n"
+    )
 
     pipeline = UploadPipeline(
         settings=settings,
         status=status,
         cache=cache,
-        known_paths=known_paths,
-        progress=PipelineProgress(hash_total=total),
+        local_root=local_root,
+        progress=PipelineProgress(),
     )
 
+    scan_thread = threading.Thread(
+        target=pipeline_scan_worker,
+        args=(pipeline,),
+        name="pipeline-scan",
+        daemon=True,
+    )
     hash_thread = threading.Thread(
         target=pipeline_hash_worker,
-        args=(pipeline, all_files),
+        args=(pipeline,),
         name="pipeline-hash",
         daemon=True,
     )
@@ -1320,9 +1395,26 @@ def process_files(settings: dict[str, Any]) -> int:
         daemon=True,
     )
 
+    if not local_root.exists():
+        print(f"Local folder not found: {local_root}")
+        return 0
+
+    scan_thread.start()
     hash_thread.start()
     cache_thread.start()
     display_thread.start()
+
+    scan_thread.join()
+    pipeline.check_error()
+    with pipeline.progress.lock:
+        discovered = pipeline.progress.scan_discovered
+    if discovered == 0:
+        hash_thread.join()
+        cache_thread.join()
+        pipeline.stop_display.set()
+        display_thread.join(timeout=2)
+        print(f"No files found in {local_root}")
+        return 0
 
     server_path = settings["server_upload_path"]
     remote_base = resolve_remote_path(server_path, "")
@@ -1362,9 +1454,10 @@ def process_files(settings: dict[str, Any]) -> int:
         open_session()
         assert sftp is not None and exec_client is not None
         print(f"Connected. Server upload path: {remote_base}")
-        print(f"Stall timeout: {settings['stall_timeout_seconds']}s without data transfer\n")
-
-        sync_remote_directory_tree(sftp, server_path, local_root, tracker)
+        print(
+            "Remote folders created on demand per file "
+            f"(stall timeout {settings['stall_timeout_seconds']}s).\n"
+        )
 
         upload_thread = threading.Thread(
             target=pipeline_upload_worker,
@@ -1398,11 +1491,13 @@ def process_files(settings: dict[str, Any]) -> int:
     with pipeline.print_lock:
         print(pipeline.progress.format_dashboard())
 
+    with pipeline.progress.lock:
+        total = pipeline.progress.scan_discovered
     uploaded_count = pipeline.progress.uploaded_count
     skipped_count = pipeline.progress.skipped_count
     print(
-        f"\nDone. Uploaded: {uploaded_count}, skipped (identical): {skipped_count}, "
-        f"total in {settings['local_dir']}: {total}"
+        f"\nDone. Scanned: {total}, uploaded: {uploaded_count}, "
+        f"skipped (identical): {skipped_count}, local_dir: {settings['local_dir']}"
     )
     success_list = status.get("uploaded_success", [])
     if success_list:
