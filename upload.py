@@ -5,7 +5,8 @@ Resumable SFTP uploader for the material/ folder.
 - Uploads all files under local_dir (upload_config.json or config.json)
 - Mirrors the local folder tree on the server (same subfolders)
 - Tracks per-file upload status in config.json (including uploaded_success filename list)
-- Caches local SHA-256 scans in cache.json (append-only material/ — skip re-hash for known files)
+- Parallel pipeline: hash thread, cache writer thread, upload thread (mutex + queues)
+- Caches local SHA-256 scans in cache.json incrementally while hashing
 - Exits on network/server failure or transfer stall (progress saved in config.json)
 - Skips remote files that match local content (SHA-256 + size)
 - Server-side hash via linux/calculate_hash.py only (required; auto-deployed if missing)
@@ -20,8 +21,10 @@ import socket
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
 from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -272,13 +275,13 @@ def prune_scan_cache(cache: dict[str, Any], known_paths: set[str]) -> None:
     }
 
 
-def local_file_info(
+def resolve_local_file_info(
     rel_path: str,
     path: Path,
     status: dict[str, Any],
     cache: dict[str, Any],
-) -> tuple[dict[str, Any], bool]:
-    """Return file size/hash; reuse config.json or cache.json when size unchanged."""
+) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
+    """Return (info, from_cache, new_cache_entry). Caller persists new_cache_entry."""
     stat = path.stat()
     size = stat.st_size
 
@@ -288,7 +291,7 @@ def local_file_info(
         and status_record.get("size") == size
         and status_record.get("sha256")
     ):
-        return {"size": size, "sha256": status_record["sha256"]}, True
+        return {"size": size, "sha256": status_record["sha256"]}, True, None
 
     cache_record = cache.get("files", {}).get(rel_path)
     if (
@@ -296,15 +299,373 @@ def local_file_info(
         and cache_record.get("size") == size
         and cache_record.get("sha256")
     ):
-        return {"size": size, "sha256": cache_record["sha256"]}, True
+        return {"size": size, "sha256": cache_record["sha256"]}, True, None
 
     digest = sha256_file(path)
-    cache.setdefault("files", {})[rel_path] = {
-        "size": size,
-        "sha256": digest,
-        "cached_at": utc_now(),
-    }
-    return {"size": size, "sha256": digest}, False
+    entry = {"size": size, "sha256": digest, "cached_at": utc_now()}
+    return {"size": size, "sha256": digest}, False, entry
+
+
+def local_file_info(
+    rel_path: str,
+    path: Path,
+    status: dict[str, Any],
+    cache: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Return file size/hash; reuse config.json or cache.json when size unchanged."""
+    info, from_cache, entry = resolve_local_file_info(rel_path, path, status, cache)
+    if entry is not None:
+        cache.setdefault("files", {})[rel_path] = entry
+    return info, from_cache
+
+
+_PIPELINE_SENTINEL = object()
+@dataclass
+class UploadJob:
+    rel_path: str
+    local_path: Path
+    info: dict[str, Any]
+
+
+@dataclass
+class PipelineProgress:
+    hash_total: int
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    hash_done: int = 0
+    hash_cached: int = 0
+    hash_computed: int = 0
+    hash_current: str = ""
+    cache_saved: int = 0
+    cache_pending: int = 0
+    cache_current: str = ""
+    upload_queued: int = 0
+    upload_done: int = 0
+    upload_current: str = ""
+    uploaded_count: int = 0
+    skipped_count: int = 0
+    upload_busy: bool = False
+    finished: bool = False
+    failed: bool = False
+
+    def _bar(self, done: int, total: int, width: int = 20) -> str:
+        if total <= 0:
+            return "[" + " " * width + "]"
+        filled = min(width, int(width * done / total))
+        return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+    def _clip(self, text: str, max_len: int = 42) -> str:
+        text = text or "—"
+        if len(text) <= max_len:
+            return text.ljust(max_len)
+        return text[: max_len - 1] + "…"
+
+    def format_dashboard(self) -> str:
+        with self.lock:
+            h_done, h_tot = self.hash_done, self.hash_total
+            h_cached, h_computed = self.hash_cached, self.hash_computed
+            c_saved, c_pending = self.cache_saved, self.cache_pending
+            u_done, u_queued = self.upload_done, self.upload_queued
+            u_ok, u_skip = self.uploaded_count, self.skipped_count
+            hash_cur = self.hash_current
+            cache_cur = self.cache_current
+            upload_cur = self.upload_current
+            upload_busy = self.upload_busy
+
+        lines = [
+            "┌─ Pipeline " + "─" * 56 + "┐",
+            f"│ Hash  {self._bar(h_done, h_tot)} {h_done:5}/{h_tot:<5} "
+            f"cache:{h_cached} new:{h_computed}  {self._clip(hash_cur)} │",
+            f"│ Cache {self._bar(c_saved, max(c_saved + c_pending, 1))} "
+            f"{c_saved:5} saved  pending:{c_pending:4}  {self._clip(cache_cur)} │",
+            f"│ Upload{self._bar(u_done, max(u_queued, 1))} {u_done:5}/{u_queued:<5} "
+            f"ok:{u_ok} skip:{u_skip}  {self._clip(upload_cur)} │",
+        ]
+        if upload_busy:
+            lines.append("│" + " active transfer (file progress below) ".center(58) + "│")
+        lines.append("└" + "─" * 58 + "┘")
+        return "\n".join(lines)
+
+
+@dataclass
+class UploadPipeline:
+    settings: dict[str, Any]
+    status: dict[str, Any]
+    cache: dict[str, Any]
+    known_paths: set[str]
+    progress: PipelineProgress
+    ready_queue: Queue[Any] = field(default_factory=Queue)
+    cache_lock: threading.Lock = field(default_factory=threading.Lock)
+    status_lock: threading.Lock = field(default_factory=threading.Lock)
+    print_lock: threading.Lock = field(default_factory=threading.Lock)
+    pending_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    cache_dirty: threading.Event = field(default_factory=threading.Event)
+    hash_complete: threading.Event = field(default_factory=threading.Event)
+    stop_display: threading.Event = field(default_factory=threading.Event)
+    error: list[BaseException] = field(default_factory=list)
+
+    def set_error(self, exc: BaseException) -> None:
+        with self.print_lock:
+            if not self.error:
+                self.error.append(exc)
+                self.progress.failed = True
+
+    def check_error(self) -> None:
+        if self.error:
+            raise self.error[0]
+
+
+def _truncate_display_path(rel_path: str, max_parts: int = 2) -> str:
+    parts = rel_path.replace("\\", "/").split("/")
+    if len(parts) <= max_parts:
+        return rel_path
+    return ".../" + "/".join(parts[-max_parts:])
+
+
+def pipeline_status_loop(pipeline: UploadPipeline) -> None:
+    """Refresh the 3-line pipeline dashboard until stop_display is set."""
+    last_line_count = 0
+    while not pipeline.stop_display.wait(0.4):
+        if pipeline.progress.upload_busy:
+            continue
+        block = pipeline.progress.format_dashboard()
+        line_count = block.count("\n") + 1
+        with pipeline.print_lock:
+            if last_line_count:
+                sys.stdout.write(f"\033[{last_line_count}A")
+            sys.stdout.write(block + "\n")
+            sys.stdout.flush()
+            last_line_count = line_count
+    with pipeline.print_lock:
+        if last_line_count:
+            sys.stdout.write(f"\033[{last_line_count}A\033[J")
+            sys.stdout.flush()
+
+
+def pipeline_hash_worker(
+    pipeline: UploadPipeline,
+    all_files: list[tuple[str, Path]],
+) -> None:
+    """Thread 1: compute local hashes and enqueue files ready for upload."""
+    for rel_path, path in all_files:
+        pipeline.check_error()
+        short = _truncate_display_path(rel_path)
+        with pipeline.progress.lock:
+            pipeline.progress.hash_current = short
+
+        stat = path.stat()
+        size = stat.st_size
+        new_entry = None
+        from_cache = False
+
+        status_record = pipeline.status.get("files", {}).get(rel_path)
+        if (
+            status_record
+            and status_record.get("size") == size
+            and status_record.get("sha256")
+        ):
+            info = {"size": size, "sha256": status_record["sha256"]}
+            from_cache = True
+        else:
+            with pipeline.cache_lock:
+                cache_record = pipeline.cache.get("files", {}).get(rel_path)
+            if (
+                cache_record
+                and cache_record.get("size") == size
+                and cache_record.get("sha256")
+            ):
+                info = {"size": size, "sha256": cache_record["sha256"]}
+                from_cache = True
+            else:
+                digest = sha256_file(path)
+                info = {"size": size, "sha256": digest}
+                new_entry = {"size": size, "sha256": digest, "cached_at": utc_now()}
+
+        with pipeline.progress.lock:
+            pipeline.progress.hash_done += 1
+            if from_cache:
+                pipeline.progress.hash_cached += 1
+            else:
+                pipeline.progress.hash_computed += 1
+
+        if new_entry is not None:
+            with pipeline.cache_lock:
+                pipeline.pending_cache[rel_path] = new_entry
+                pending = len(pipeline.pending_cache)
+            with pipeline.progress.lock:
+                pipeline.progress.cache_pending = pending
+            pipeline.cache_dirty.set()
+
+        if needs_upload(rel_path, info, pipeline.status):
+            pipeline.ready_queue.put(UploadJob(rel_path, path, info))
+            with pipeline.progress.lock:
+                pipeline.progress.upload_queued += 1
+
+    pipeline.ready_queue.put(_PIPELINE_SENTINEL)
+    pipeline.hash_complete.set()
+    pipeline.cache_dirty.set()
+    with pipeline.progress.lock:
+        pipeline.progress.hash_current = "done"
+        pipeline.progress.finished = True
+
+
+def pipeline_cache_worker(pipeline: UploadPipeline) -> None:
+    """Thread 2: flush new hashes to cache.json while hashing runs."""
+    while True:
+        pipeline.cache_dirty.wait(timeout=0.5)
+        pipeline.check_error()
+
+        batch: dict[str, dict[str, Any]] = {}
+        with pipeline.cache_lock:
+            if pipeline.pending_cache:
+                batch = dict(pipeline.pending_cache)
+                pipeline.pending_cache.clear()
+            pending_left = len(pipeline.pending_cache)
+
+        with pipeline.progress.lock:
+            pipeline.progress.cache_pending = pending_left
+
+        if batch:
+            with pipeline.progress.lock:
+                pipeline.progress.cache_current = f"flush {len(batch)}"
+
+            with pipeline.cache_lock:
+                pipeline.cache.setdefault("files", {}).update(batch)
+
+            save_scan_cache(pipeline.settings, pipeline.cache)
+
+            with pipeline.progress.lock:
+                pipeline.progress.cache_saved += len(batch)
+                pipeline.progress.cache_current = "idle"
+
+        if pipeline.hash_complete.is_set():
+            with pipeline.cache_lock:
+                if not pipeline.pending_cache:
+                    break
+
+    prune_scan_cache(pipeline.cache, pipeline.known_paths)
+    save_scan_cache(pipeline.settings, pipeline.cache)
+    with pipeline.progress.lock:
+        pipeline.progress.cache_current = "done"
+        pipeline.progress.cache_pending = 0
+
+
+def pipeline_upload_worker(
+    pipeline: UploadPipeline,
+    sftp: paramiko.SFTPClient,
+    exec_client: paramiko.SSHClient,
+    tracker: TransferTracker,
+) -> None:
+    """Thread 3: upload files as soon as their hash is ready."""
+    hash_script = pipeline.settings["server_calculate_hash_script"]
+    server_path = pipeline.settings["server_upload_path"]
+
+    while True:
+        pipeline.check_error()
+        item = pipeline.ready_queue.get()
+        if item is _PIPELINE_SENTINEL:
+            break
+
+        job: UploadJob = item
+        rel_path = job.rel_path
+        with pipeline.progress.lock:
+            upload_num = pipeline.progress.upload_done + 1
+            upload_total = pipeline.progress.upload_queued
+        prefix = f"[{upload_num}/{upload_total}] {rel_path}"
+
+        with pipeline.progress.lock:
+            pipeline.progress.upload_current = _truncate_display_path(rel_path)
+
+        remote_path = resolve_remote_path(server_path, rel_path)
+        tracker.check()
+
+        try:
+            tracker.set_activity("Pending", f"compare: {rel_path}")
+            remote_info = remote_file_info(
+                exec_client,
+                hash_script,
+                remote_path,
+                pipeline.settings,
+                tracker,
+                label=prefix,
+            )
+            if (
+                remote_info is not None
+                and remote_info["size"] == job.info["size"]
+                and remote_info["sha256"] == job.info["sha256"]
+            ):
+                with pipeline.status_lock:
+                    mark_uploaded(
+                        pipeline.settings,
+                        pipeline.status,
+                        rel_path,
+                        job.info,
+                        action="skipped_identical",
+                    )
+                with pipeline.progress.lock:
+                    pipeline.progress.skipped_count += 1
+                    pipeline.progress.upload_done += 1
+                with pipeline.print_lock:
+                    pipeline.progress.upload_busy = True
+                    pipeline.stop_display.set()
+                    time.sleep(0.05)
+                    print(f"{prefix} ... {SKIP} skipped (identical on server)")
+                    pipeline.progress.upload_busy = False
+                    pipeline.stop_display.clear()
+                continue
+
+            with pipeline.print_lock:
+                pipeline.progress.upload_busy = True
+                pipeline.stop_display.set()
+                time.sleep(0.05)
+
+            upload_with_retry(
+                pipeline.settings,
+                sftp,
+                job.local_path,
+                remote_path,
+                job.info["size"],
+                tracker,
+                prefix,
+            )
+
+            tracker.set_activity("Verifying upload", prefix)
+            verify = remote_file_info(
+                exec_client,
+                hash_script,
+                remote_path,
+                pipeline.settings,
+                tracker,
+                label=prefix,
+            )
+            if (
+                verify is None
+                or verify["size"] != job.info["size"]
+                or verify["sha256"] != job.info["sha256"]
+            ):
+                raise RuntimeError("Upload finished but remote verification failed.")
+
+            with pipeline.status_lock:
+                mark_uploaded(
+                    pipeline.settings,
+                    pipeline.status,
+                    rel_path,
+                    job.info,
+                    action="uploaded",
+                )
+            with pipeline.progress.lock:
+                pipeline.progress.uploaded_count += 1
+                pipeline.progress.upload_done += 1
+            print(f"{prefix} ... {CHECK} success")
+        except BaseException as exc:
+            pipeline.set_error(exc)
+            raise
+        finally:
+            with pipeline.print_lock:
+                pipeline.progress.upload_busy = False
+                pipeline.stop_display.clear()
+
+    with pipeline.progress.lock:
+        pipeline.progress.upload_current = "done"
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -927,36 +1288,41 @@ def process_files(settings: dict[str, Any]) -> int:
         print(f"No files found in {local_root}")
         return 0
 
-    print(f"Local upload folder: {local_root}")
-    print("Scanning local files...")
-    queue: list[tuple[str, Path, dict[str, Any]]] = []
-    cached_count = 0
-    hashed_count = 0
-    known_paths = {rel_path for rel_path, _ in all_files}
-
-    for rel_path, path in all_files:
-        info, from_cache = local_file_info(rel_path, path, status, cache)
-        if from_cache:
-            cached_count += 1
-        else:
-            hashed_count += 1
-        if needs_upload(rel_path, info, status):
-            queue.append((rel_path, path, info))
-
-    prune_scan_cache(cache, known_paths)
-    save_scan_cache(settings, cache)
-
     total = len(all_files)
-    pending = len(queue)
-    print(
-        f"Found {total} file(s). "
-        f"{cached_count} from cache, {hashed_count} hashed. "
-        f"{pending} need upload/check, {total - pending} already marked uploaded.\n"
+    known_paths = {rel_path for rel_path, _ in all_files}
+    print(f"Local upload folder: {local_root}")
+    print(f"Found {total} file(s). Starting parallel pipeline (hash | cache | upload).\n")
+
+    pipeline = UploadPipeline(
+        settings=settings,
+        status=status,
+        cache=cache,
+        known_paths=known_paths,
+        progress=PipelineProgress(hash_total=total),
     )
 
-    if pending == 0:
-        print("Nothing to do.")
-        return 0
+    hash_thread = threading.Thread(
+        target=pipeline_hash_worker,
+        args=(pipeline, all_files),
+        name="pipeline-hash",
+        daemon=True,
+    )
+    cache_thread = threading.Thread(
+        target=pipeline_cache_worker,
+        args=(pipeline,),
+        name="pipeline-cache",
+        daemon=True,
+    )
+    display_thread = threading.Thread(
+        target=pipeline_status_loop,
+        args=(pipeline,),
+        name="pipeline-status",
+        daemon=True,
+    )
+
+    hash_thread.start()
+    cache_thread.start()
+    display_thread.start()
 
     server_path = settings["server_upload_path"]
     remote_base = resolve_remote_path(server_path, "")
@@ -965,7 +1331,7 @@ def process_files(settings: dict[str, Any]) -> int:
     exec_client: paramiko.SSHClient | None = None
     tracker = TransferTracker(int(settings["stall_timeout_seconds"]))
     watchdog_stop: threading.Event | None = None
-    hash_script = settings["server_calculate_hash_script"]
+    upload_thread: threading.Thread | None = None
 
     def open_session() -> None:
         nonlocal client, sftp, exec_client, watchdog_stop
@@ -992,67 +1358,36 @@ def process_files(settings: dict[str, Any]) -> int:
 
         watchdog_stop = tracker.start_watchdog(on_stall=on_stall)
 
-    open_session()
-    assert exec_client is not None
-    print(f"Connected. Server upload path: {remote_base}\n")
-    print(f"Stall timeout: {settings['stall_timeout_seconds']}s without data transfer\n")
-
-    uploaded_count = 0
-    skipped_count = 0
-    processed = 0
-
     try:
+        open_session()
+        assert sftp is not None and exec_client is not None
+        print(f"Connected. Server upload path: {remote_base}")
+        print(f"Stall timeout: {settings['stall_timeout_seconds']}s without data transfer\n")
+
         sync_remote_directory_tree(sftp, server_path, local_root, tracker)
 
-        for rel_path, local_path, info in queue:
-            tracker.check()
-            processed += 1
-            remote_path = resolve_remote_path(settings["server_upload_path"], rel_path)
-            prefix = f"[{processed}/{pending}] {rel_path}"
+        upload_thread = threading.Thread(
+            target=pipeline_upload_worker,
+            args=(pipeline, sftp, exec_client, tracker),
+            name="pipeline-upload",
+            daemon=True,
+        )
+        upload_thread.start()
 
-            tracker.set_activity("Pending", f"compare with server: {rel_path}")
-            remote_info = remote_file_info(
-                exec_client,
-                hash_script,
-                remote_path,
-                settings,
-                tracker,
-                label=prefix,
-            )
-            if (
-                remote_info is not None
-                and remote_info["size"] == info["size"]
-                and remote_info["sha256"] == info["sha256"]
-            ):
-                mark_uploaded(settings, status, rel_path, info, action="skipped_identical")
-                skipped_count += 1
-                print(f"{prefix} ... {SKIP} skipped (identical on server)")
-                continue
+        hash_thread.join()
+        upload_thread.join()
+        cache_thread.join()
+        pipeline.check_error()
 
-            upload_with_retry(
-                settings, sftp, local_path, remote_path, info["size"], tracker, prefix
-            )
-
-            tracker.set_activity("Verifying upload", prefix)
-            verify = remote_file_info(
-                exec_client,
-                hash_script,
-                remote_path,
-                settings,
-                tracker,
-                label=prefix,
-            )
-            if (
-                verify is None
-                or verify["size"] != info["size"]
-                or verify["sha256"] != info["sha256"]
-            ):
-                raise RuntimeError("Upload finished but remote verification failed.")
-
-            mark_uploaded(settings, status, rel_path, info, action="uploaded")
-            uploaded_count += 1
-            print(f"{prefix} ... {CHECK} success")
+        with pipeline.progress.lock:
+            if pipeline.progress.upload_queued == 0:
+                print("Nothing to upload.")
+    except BaseException as exc:
+        pipeline.set_error(exc)
+        raise
     finally:
+        pipeline.stop_display.set()
+        display_thread.join(timeout=2)
         if watchdog_stop is not None:
             watchdog_stop.set()
         tracker.clear_countdown()
@@ -1060,6 +1395,11 @@ def process_files(settings: dict[str, Any]) -> int:
         if exec_client is not None:
             close_ssh(exec_client, None)
 
+    with pipeline.print_lock:
+        print(pipeline.progress.format_dashboard())
+
+    uploaded_count = pipeline.progress.uploaded_count
+    skipped_count = pipeline.progress.skipped_count
     print(
         f"\nDone. Uploaded: {uploaded_count}, skipped (identical): {skipped_count}, "
         f"total in {settings['local_dir']}: {total}"
