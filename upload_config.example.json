@@ -4,7 +4,7 @@
   "username": "st78326",
   "password": "YOUR_PASSWORD_HERE",
   "local_dir": "material",
-  "remote_dir": "material",
+  "server_upload_path": "/home/YOUR_USER/public_html/material",
   "status_file": "config.json",
   "network_check_interval_seconds": 10,
   "ssh_connect_timeout_seconds": 30

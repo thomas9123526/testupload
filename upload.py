@@ -13,12 +13,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _reexec_in_project_venv() -> None:
+    """Use .venv Python when present so `python upload.py` finds installed deps."""
+    if os.environ.get("UPLOAD_NO_VENV_REEXEC") == "1":
+        return
+
+    for venv_python in (
+        SCRIPT_DIR / ".venv" / "Scripts" / "python.exe",
+        SCRIPT_DIR / ".venv" / "bin" / "python",
+    ):
+        if not venv_python.is_file():
+            continue
+        try:
+            if Path(sys.executable).resolve() == venv_python.resolve():
+                return
+        except OSError:
+            return
+        os.environ["UPLOAD_NO_VENV_REEXEC"] = "1"
+        os.execv(str(venv_python), [str(venv_python), *sys.argv])
+
+
+_reexec_in_project_venv()
 
 try:
     import paramiko
@@ -28,12 +54,16 @@ try:
         SSHException,
     )
 except ImportError:
+    venv_python = SCRIPT_DIR / ".venv" / "Scripts" / "python.exe"
     print("Missing dependency: paramiko")
-    print("Install with: pip install paramiko")
+    if venv_python.is_file():
+        print(f"Project venv not used. Run: {venv_python} upload.py")
+        print("Or: .\\.venv\\Scripts\\Activate.ps1  then  python upload.py")
+    else:
+        print("Create venv: python -m venv .venv")
+        print("Then: .\\.venv\\Scripts\\pip.exe install -r requirements.txt")
     sys.exit(1)
 
-
-SCRIPT_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = SCRIPT_DIR / "upload_config.json"
 CHECK = "\u2713"  # ✓
 SKIP = "\u2298"   # ⊘
@@ -55,12 +85,22 @@ def load_settings() -> dict[str, Any]:
     with SETTINGS_FILE.open("r", encoding="utf-8") as handle:
         settings = json.load(handle)
 
-    required = ("host", "port", "username", "password", "local_dir", "remote_dir")
+    required = ("host", "port", "username", "password", "local_dir")
     missing = [key for key in required if not settings.get(key)]
+    upload_path = (settings.get("server_upload_path") or settings.get("remote_dir") or "").strip()
+    if not upload_path:
+        missing.append("server_upload_path")
     if missing:
         print(f"Missing settings in {SETTINGS_FILE.name}: {', '.join(missing)}")
         sys.exit(1)
 
+    settings["server_upload_path"] = upload_path.replace("\\", "/")
+    if not settings["server_upload_path"].startswith("/"):
+        print(
+            f"server_upload_path must be an absolute server path (start with /), "
+            f"got: {settings['server_upload_path']!r}"
+        )
+        sys.exit(1)
     settings.setdefault("status_file", "config.json")
     settings.setdefault("network_check_interval_seconds", 10)
     settings.setdefault("ssh_connect_timeout_seconds", 30)
@@ -237,24 +277,9 @@ def connect_ssh(settings: dict[str, Any]) -> tuple[paramiko.SSHClient, paramiko.
         raise
 
 
-def remote_home(client: paramiko.SSHClient) -> str:
-    _, stdout, _ = client.exec_command("printf %s \"$HOME\"")
-    home = stdout.read().decode("utf-8", errors="replace").strip()
-    if not home:
-        raise SSHDisconnectedError("Could not determine remote home directory.")
-    return home
-
-
-def resolve_remote_path(remote_home_dir: str, remote_dir: str, rel_path: str) -> str:
-    base = remote_dir.replace("\\", "/")
-    if base.startswith("~/"):
-        base = f"{remote_home_dir}/{base[2:]}"
-    elif base == "~":
-        base = remote_home_dir
-    elif not base.startswith("/"):
-        base = f"{remote_home_dir}/{base}"
-
-    base = base.rstrip("/")
+def resolve_remote_path(server_upload_path: str, rel_path: str) -> str:
+    """Build full remote path: absolute server_upload_path + path under material/."""
+    base = server_upload_path.replace("\\", "/").rstrip("/")
     rel_path = rel_path.replace("\\", "/").strip("/")
     if not rel_path:
         return base
@@ -295,12 +320,11 @@ def ensure_remote_dir(sftp: paramiko.SFTPClient, remote_path: str) -> None:
 
 def sync_remote_directory_tree(
     sftp: paramiko.SFTPClient,
-    remote_home_dir: str,
-    remote_dir: str,
+    server_upload_path: str,
     local_root: Path,
 ) -> None:
     """Create the same folder tree on the server as inside material/."""
-    remote_base = resolve_remote_path(remote_home_dir, remote_dir, "")
+    remote_base = resolve_remote_path(server_upload_path, "")
     local_dirs = scan_local_directories(local_root)
 
     print(f"Creating remote folder tree under {remote_base} ...")
@@ -308,7 +332,7 @@ def sync_remote_directory_tree(
     print(f"  {CHECK} {remote_base}/")
 
     for rel_dir in local_dirs:
-        remote_directory = resolve_remote_path(remote_home_dir, remote_dir, rel_dir)
+        remote_directory = resolve_remote_path(server_upload_path, rel_dir)
         ensure_remote_directory(sftp, remote_directory)
         print(f"  {CHECK} {remote_directory}/")
 
@@ -417,11 +441,11 @@ def process_files(settings: dict[str, Any]) -> int:
 
     print(f"Connecting to {settings['username']}@{settings['host']}:{settings['port']} ...")
     client, sftp = connect_ssh(settings)
-    home = remote_home(client)
-    remote_base = resolve_remote_path(home, settings["remote_dir"], "")
-    print(f"Connected. Remote base: {remote_base}\n")
+    server_path = settings["server_upload_path"]
+    remote_base = resolve_remote_path(server_path, "")
+    print(f"Connected. Server upload path: {remote_base}\n")
 
-    sync_remote_directory_tree(sftp, home, settings["remote_dir"], local_root)
+    sync_remote_directory_tree(sftp, server_path, local_root)
 
     uploaded_count = 0
     skipped_count = 0
@@ -430,7 +454,7 @@ def process_files(settings: dict[str, Any]) -> int:
     try:
         for rel_path, local_path, info in queue:
             processed += 1
-            remote_path = resolve_remote_path(home, settings["remote_dir"], rel_path)
+            remote_path = resolve_remote_path(settings["server_upload_path"], rel_path)
             prefix = f"[{processed}/{pending}] {rel_path}"
 
             while True:
