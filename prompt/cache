@@ -1,0 +1,11 @@
+=== Starting upload.py ===
+Scanning local files...
+
+this take many times. Is there any solution to reduce this by using cache and save the scanning result to some files? keep in mind that the the data inside material can be only be added per files. and once the file is put inside material folder, that file content is never changed because I don't replace or modify it. I only add new files inside material folder.
+
+
+
+=== Starting upload.py ===
+Scanning local files...
+
+this take many times. Is there any solution to reduce this by using cache and save the scanning result to some files? keep in mind that the the data inside material can be only be added per files. and once the file is put inside material folder, that file content is never changed because I don't replace or modify it. I only add new files inside material folder.
