@@ -7,7 +7,7 @@ Resumable SFTP uploader for the material/ folder.
 - Caches local SHA-256 scans in cache.json (append-only material/ — skip re-hash for known files)
 - Exits on network/server failure or transfer stall (progress saved in config.json)
 - Skips remote files that match local content (SHA-256 + size)
-- Optional server-side hash via linux/calculate_hash.py over SSH exec (see server_calculate_hash_script)
+- Optional server-side hash via linux/calculate_hash.py (auto-deployed to server if missing)
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ except ImportError:
     sys.exit(1)
 
 SETTINGS_FILE = SCRIPT_DIR / "upload_config.json"
+LOCAL_HASH_SCRIPT = SCRIPT_DIR / "linux" / "calculate_hash.py"
 CHECK = "\u2713"  # ✓
 SKIP = "\u2298"   # ⊘
 FAIL = "\u2717"   # ✗
@@ -640,6 +641,23 @@ def sync_remote_directory_tree(
     print()
 
 
+def deploy_server_hash_script(
+    sftp: paramiko.SFTPClient,
+    remote_path: str,
+    tracker: TransferTracker | None = None,
+) -> None:
+    """Upload linux/calculate_hash.py to the server when missing."""
+    if not LOCAL_HASH_SCRIPT.is_file():
+        raise FileNotFoundError(f"Local hash script not found: {LOCAL_HASH_SCRIPT}")
+
+    if tracker is not None:
+        tracker.set_activity("Uploading hash script to server", remote_path)
+
+    ensure_remote_dir(sftp, remote_path)
+    sftp.put(str(LOCAL_HASH_SCRIPT), remote_path, confirm=True)
+    sftp.stat(remote_path)
+
+
 def connect_exec_client(settings: dict[str, Any]) -> paramiko.SSHClient:
     """SSH connection for remote commands only (separate from SFTP session)."""
     client = paramiko.SSHClient()
@@ -968,9 +986,19 @@ def process_files(settings: dict[str, Any]) -> int:
                     use_server_hash_script = True
                     print(f"Server hash script: {hash_script}")
                 except OSError:
-                    print(f"{FAIL} Server hash script not found: {hash_script}")
-                    print("  Upload linux/calculate_hash.py to that path on the server.")
-                    print("  Falling back to SFTP hash (slower for large files).")
+                    print(f"Server hash script not found: {hash_script}")
+                    try:
+                        print(f"  Deploying {LOCAL_HASH_SCRIPT.name} ...")
+                        deploy_server_hash_script(sftp, hash_script, tracker)
+                        exec_client = connect_exec_client(settings)
+                        use_server_hash_script = True
+                        print(f"  {CHECK} Deployed server hash script: {hash_script}")
+                    except FileNotFoundError:
+                        print(f"  {FAIL} Local script missing: {LOCAL_HASH_SCRIPT}")
+                        print("  Falling back to SFTP hash (slower for large files).")
+                    except Exception as error:
+                        print(f"  {FAIL} Could not deploy hash script: {error}")
+                        print("  Falling back to SFTP hash.")
                 except Exception as error:
                     print(f"{FAIL} Could not open SSH exec session for hash script: {error}")
                     print("  Falling back to SFTP hash.")
