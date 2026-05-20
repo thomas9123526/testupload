@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "local_dir": "material",
+  "auto_upload_retry_seconds": 300,
+  "server_calculate_hash_script": "/home/YOUR_USER/calculate_hash.py",
+  "uploaded_success": [],
+  "files": {}
+}

@@ -2,7 +2,8 @@
 """
 Resumable SFTP uploader for the material/ folder.
 
-- Mirrors the local material/ folder tree on the server (same subfolders)
+- Uploads all files under local_dir (upload_config.json or config.json)
+- Mirrors the local folder tree on the server (same subfolders)
 - Tracks per-file upload status in config.json (including uploaded_success filename list)
 - Caches local SHA-256 scans in cache.json (append-only material/ — skip re-hash for known files)
 - Exits on network/server failure or transfer stall (progress saved in config.json)
@@ -100,7 +101,7 @@ def load_settings() -> dict[str, Any]:
     with SETTINGS_FILE.open("r", encoding="utf-8") as handle:
         settings = json.load(handle)
 
-    required = ("host", "port", "username", "local_dir")
+    required = ("host", "port", "username")
     missing = [key for key in required if not settings.get(key)]
     upload_path = (settings.get("server_upload_path") or settings.get("remote_dir") or "").strip()
     if not upload_path:
@@ -133,6 +134,12 @@ def load_settings() -> dict[str, Any]:
     settings.setdefault("ssh_connect_timeout_seconds", 30)
     settings.setdefault("stall_timeout_seconds", 600)
     merge_config_json_settings(settings)
+    if not str(settings.get("local_dir", "")).strip():
+        print(
+            f"Missing local_dir: set it in {settings['status_file']} or {SETTINGS_FILE.name} "
+            f"(folder to upload, relative to project or absolute path)."
+        )
+        sys.exit(1)
     script = str(settings.get("server_calculate_hash_script", "")).strip().replace("\\", "/")
     settings["server_calculate_hash_script"] = script
     if not script:
@@ -151,7 +158,7 @@ def load_settings() -> dict[str, Any]:
 
 
 def merge_config_json_settings(settings: dict[str, Any]) -> None:
-    """Apply optional keys from local config.json (e.g. server_calculate_hash_script)."""
+    """Apply optional keys from local config.json (local_dir, server_calculate_hash_script)."""
     path = status_path(settings)
     if not path.is_file():
         return
@@ -159,10 +166,21 @@ def merge_config_json_settings(settings: dict[str, Any]) -> None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return
+    if data.get("local_dir"):
+        settings["local_dir"] = str(data["local_dir"]).strip()
     if data.get("server_calculate_hash_script"):
         settings["server_calculate_hash_script"] = str(
             data["server_calculate_hash_script"]
         ).strip()
+
+
+def local_root_path(settings: dict[str, Any]) -> Path:
+    """Resolve local upload folder from local_dir (relative to project or absolute)."""
+    raw = str(settings["local_dir"]).strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = SCRIPT_DIR / path
+    return path.resolve()
 
 
 def status_path(settings: dict[str, Any]) -> Path:
@@ -900,7 +918,7 @@ def upload_with_retry(
 
 
 def process_files(settings: dict[str, Any]) -> int:
-    local_root = SCRIPT_DIR / settings["local_dir"]
+    local_root = local_root_path(settings)
     status = load_status(settings)
     cache = load_scan_cache(settings)
     all_files = scan_local_files(local_root)
@@ -909,6 +927,7 @@ def process_files(settings: dict[str, Any]) -> int:
         print(f"No files found in {local_root}")
         return 0
 
+    print(f"Local upload folder: {local_root}")
     print("Scanning local files...")
     queue: list[tuple[str, Path, dict[str, Any]]] = []
     cached_count = 0
@@ -1043,7 +1062,7 @@ def process_files(settings: dict[str, Any]) -> int:
 
     print(
         f"\nDone. Uploaded: {uploaded_count}, skipped (identical): {skipped_count}, "
-        f"total in material/: {total}"
+        f"total in {settings['local_dir']}: {total}"
     )
     success_list = status.get("uploaded_success", [])
     if success_list:
