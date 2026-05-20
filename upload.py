@@ -3,7 +3,7 @@
 Resumable SFTP uploader for the material/ folder.
 
 - Mirrors the local material/ folder tree on the server (same subfolders)
-- Tracks per-file upload status in config.json
+- Tracks per-file upload status in config.json (including uploaded_success filename list)
 - Retries when the network drops (waits until connectivity returns)
 - Reconnects when the SSH/SFTP session drops and resumes from config.json
 - Skips remote files that match local content (SHA-256 + size)
@@ -125,20 +125,31 @@ def status_path(settings: dict[str, Any]) -> Path:
     return path
 
 
+def sync_uploaded_success_list(status: dict[str, Any]) -> None:
+    """Rebuild flat list of successfully uploaded filenames for config.json."""
+    status["uploaded_success"] = sorted(
+        rel_path
+        for rel_path, record in status.get("files", {}).items()
+        if record.get("status") == "uploaded"
+    )
+
+
 def load_status(settings: dict[str, Any]) -> dict[str, Any]:
     path = status_path(settings)
     if not path.exists():
-        return {"version": 1, "files": {}}
+        return {"version": 1, "uploaded_success": [], "files": {}}
 
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
     data.setdefault("version", 1)
     data.setdefault("files", {})
+    sync_uploaded_success_list(data)
     return data
 
 
 def save_status(settings: dict[str, Any], status: dict[str, Any]) -> None:
+    sync_uploaded_success_list(status)
     path = status_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -585,6 +596,9 @@ def process_files(settings: dict[str, Any]) -> int:
         f"\nDone. Uploaded: {uploaded_count}, skipped (identical): {skipped_count}, "
         f"total in material/: {total}"
     )
+    success_list = status.get("uploaded_success", [])
+    if success_list:
+        print(f"Successful files in {settings['status_file']}: {len(success_list)}")
     return 0
 
 
