@@ -100,6 +100,11 @@ def error_message(exit_code: int) -> str:
         2: "Upload failed: SSH connection lost (exit 2). Progress saved in config.json.",
         3: "Upload failed: network unavailable (exit 3). Progress saved in config.json.",
         4: "Upload failed: transfer stalled - no data moved (exit 4). Progress saved in config.json.",
+        5: "Upload failed: server hash script error (exit 5). Check calculate_hash.py on the server.",
+        6: (
+            "Upload failed: remote verification after upload (exit 6). "
+            "File may be on server; retry often skips it if identical."
+        ),
         130: "Upload interrupted (Ctrl+C). Auto upload stopped.",
     }
     return messages.get(

@@ -90,6 +90,41 @@ class ServerHashScriptError(Exception):
     """Raised when server calculate_hash.py is required but unavailable."""
 
 
+class VerificationFailedError(Exception):
+    """Raised when SFTP upload completes but remote hash/size does not match."""
+
+    def __init__(
+        self,
+        remote_path: str,
+        expected: dict[str, Any],
+        verify: dict[str, Any] | None,
+    ) -> None:
+        self.remote_path = remote_path
+        self.expected = expected
+        self.verify = verify
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        exp = (
+            f"size={self.expected['size']} "
+            f"sha256={self.expected['sha256'][:16]}..."
+        )
+        if self.verify is None:
+            got = (
+                "no data from server hash script "
+                "(file missing on server or SSH exec session died during verify)"
+            )
+        else:
+            got = (
+                f"size={self.verify['size']} "
+                f"sha256={self.verify['sha256'][:16]}..."
+            )
+        return (
+            f"Upload finished but remote verification failed for {self.remote_path}. "
+            f"Expected {exp}. Got {got}."
+        )
+
+
 def load_settings() -> dict[str, Any]:
     if not SETTINGS_FILE.exists():
         example = SCRIPT_DIR / "upload_config.example.json"
@@ -741,6 +776,21 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def wait_channel_exit(
+    channel: Any,
+    timeout: float,
+    tracker: TransferTracker | None = None,
+) -> None:
+    """Wait for SSH channel completion; refresh stall timer while hashing on server."""
+    deadline = time.monotonic() + timeout
+    while not channel.exit_status_ready():
+        if tracker is not None:
+            tracker.touch()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"remote command timed out after {int(timeout)}s")
+        time.sleep(0.25)
+
+
 def remote_file_info_via_script(
     exec_client: paramiko.SSHClient,
     script_path: str,
@@ -764,9 +814,13 @@ def remote_file_info_via_script(
         command = f"{python_bin} {quoted_script} {quoted_file}"
         try:
             _, stdout, stderr = exec_client.exec_command(command, timeout=timeout)
+            wait_channel_exit(stdout.channel, timeout, tracker)
             exit_code = stdout.channel.recv_exit_status()
             output = stdout.read().decode("utf-8", errors="replace").strip()
             err = stderr.read().decode("utf-8", errors="replace").strip()
+        except TimeoutError as error:
+            last_error = str(error)
+            continue
         except Exception as error:
             last_error = str(error)
             if is_ssh_disconnect(error):
@@ -775,8 +829,13 @@ def remote_file_info_via_script(
 
         if exit_code != 0:
             last_error = err or output or f"exit {exit_code}"
-            if "not_found" in output or exit_code == 1:
-                return None
+            if output:
+                try:
+                    data = json.loads(output)
+                    if data.get("error") == "not_found":
+                        return None
+                except json.JSONDecodeError:
+                    pass
             continue
 
         try:
@@ -817,6 +876,43 @@ def remote_file_info(
         tracker,
         label,
     )
+
+
+def verify_uploaded_file(
+    settings: dict[str, Any],
+    exec_client: paramiko.SSHClient,
+    hash_script: str,
+    remote_path: str,
+    info: dict[str, Any],
+    tracker: TransferTracker,
+    label: str,
+) -> paramiko.SSHClient:
+    """Verify remote hash/size after upload; reconnect exec SSH and retry on failure."""
+    last_verify: dict[str, Any] | None = None
+    for attempt in range(1, 4):
+        if attempt > 1:
+            close_ssh(exec_client, None)
+            tracker.set_activity("Reconnecting SSH exec for verify", label)
+            tracker.touch()
+            time.sleep(min(attempt, 3))
+            exec_client = connect_exec_client(settings)
+        verify = remote_file_info(
+            exec_client,
+            hash_script,
+            remote_path,
+            settings,
+            tracker,
+            label=label,
+        )
+        if (
+            verify is not None
+            and verify["size"] == info["size"]
+            and verify["sha256"] == info["sha256"]
+        ):
+            return exec_client
+        last_verify = verify
+
+    raise VerificationFailedError(remote_path, info, last_verify)
 
 
 def format_bytes(num: int) -> str:
@@ -1034,20 +1130,15 @@ def process_files(settings: dict[str, Any]) -> int:
             )
 
             tracker.set_activity("Verifying upload", prefix)
-            verify = remote_file_info(
+            exec_client = verify_uploaded_file(
+                settings,
                 exec_client,
                 hash_script,
                 remote_path,
-                settings,
+                info,
                 tracker,
-                label=prefix,
+                prefix,
             )
-            if (
-                verify is None
-                or verify["size"] != info["size"]
-                or verify["sha256"] != info["sha256"]
-            ):
-                raise RuntimeError("Upload finished but remote verification failed.")
 
             mark_uploaded(settings, status, rel_path, info, action="uploaded")
             uploaded_count += 1
@@ -1099,6 +1190,14 @@ def main() -> int:
         print(f"\n{FAIL} Server hash script error: {error}")
         print("Remote file hashes require calculate_hash.py on the server.")
         return 5
+    except VerificationFailedError as error:
+        print(f"\n{FAIL} {error}")
+        print(
+            "The file may already be on the server. Restart upload to resume; "
+            "identical files are skipped automatically."
+        )
+        print(f"Progress saved in {settings['status_file']}.")
+        return 6
     except KeyboardInterrupt:
         print(f"\nInterrupted. Progress saved in {settings['status_file']}.")
         return 130
